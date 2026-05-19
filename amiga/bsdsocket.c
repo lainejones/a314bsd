@@ -69,6 +69,11 @@ struct BsdSession {
     LONG                   errno_val;
     UBYTE                  seq;
 
+    /* protoent result buffer — filled by getprotobyname/getprotobynumber */
+    struct protoent        pent;
+    BYTE                   pent_name[16];
+    APTR                   pent_aliases[1]; /* { NULL } */
+
     /* hostent result buffers — reused across gethostbyname calls */
     struct hostent         hent;
     BYTE                   hname[256];
@@ -78,6 +83,12 @@ struct BsdSession {
 
     /* inet_ntoa result buffer */
     BYTE                   ntoa_buf[20];
+
+    /* servent result buffers — reused across getservby* calls */
+    struct servent         sent;
+    BYTE                   sent_name[64];   /* service name  */
+    BYTE                   sent_proto[16];  /* protocol name */
+    APTR                   sent_aliases[1]; /* { NULL }      */
 
     /* Unified request/response I/O buffer */
     UBYTE                  io_buf[SESSION_IO_SIZE];
@@ -217,6 +228,17 @@ struct BsdBase *bsd_open(struct BsdBase *base)
     sess->hent.h_addrtype = AF_INET;
     sess->hent.h_length   = 4;
     sess->hent.h_addr_list= (char **)sess->haddr_list;
+
+    /* Wire up servent in the session (pointers never change) */
+    sess->sent_aliases[0] = NULL;
+    sess->sent.s_name     = sess->sent_name;
+    sess->sent.s_aliases  = (char **)sess->sent_aliases;
+    sess->sent.s_proto    = sess->sent_proto;
+
+    /* Wire up protoent in the session (pointers never change) */
+    sess->pent_aliases[0] = NULL;
+    sess->pent.p_name     = sess->pent_name;
+    sess->pent.p_aliases  = (char **)sess->pent_aliases;
 
     sess->task = FindTask(NULL);
     sess->port = port;
@@ -961,24 +983,138 @@ struct netent *bsd_getnetbyaddr(ULONG d0 __asm("d0"), LONG d1 __asm("d1"),
 struct servent *bsd_getservbyname(STRPTR name __asm("a0"), STRPTR proto __asm("a1"),
                                    struct BsdBase *base __asm("a6"))
 {
-    (void)name; (void)proto; (void)base; return NULL;
+    struct BsdSession *sess = find_session(base);
+    struct BsdRspHdr  *rsp;
+    UBYTE  namelen, protolen, i;
+    LONG   r;
+    UBYTE *data;
+
+    if (!sess || !name) return NULL;
+
+    namelen  = 0; while (name[namelen]  && namelen  < 63) namelen++;
+    protolen = 0;
+    if (proto) { while (proto[protolen] && protolen < 15) protolen++; }
+
+    /* args: namelen(1) name[] protolen(1) proto[] */
+    fill_hdr(sess, BSDOP_GETSERVBYNAME, 2 + namelen + protolen);
+    sess->io_buf[4] = namelen;
+    for (i = 0; i < namelen;  i++) sess->io_buf[5 + i]           = (UBYTE)name[i];
+    sess->io_buf[5 + namelen] = protolen;
+    for (i = 0; i < protolen; i++) sess->io_buf[6 + namelen + i] = (UBYTE)proto[i];
+
+    r = do_rpc(sess, base->SysBase, 6 + namelen + protolen);
+    if (r < 0) return NULL;
+
+    /* result = port (host order); data = proto name bytes (no NUL) */
+    rsp  = (struct BsdRspHdr *)sess->io_buf;
+    data = sess->io_buf + BSD_RSP_HDR_SIZE;
+
+    for (i = 0; i < namelen;          i++) sess->sent_name[i]  = name[i];
+    sess->sent_name[namelen] = 0;
+
+    for (i = 0; i < rsp->datalen && i < 15; i++) sess->sent_proto[i] = (BYTE)data[i];
+    sess->sent_proto[rsp->datalen < 15 ? rsp->datalen : 15] = 0;
+
+    sess->sent.s_port = (int)r;  /* big-endian result = network order on m68k */
+    return &sess->sent;
 }
 
 struct servent *bsd_getservbyport(LONG port __asm("d0"), STRPTR proto __asm("a0"),
                                    struct BsdBase *base __asm("a6"))
 {
-    (void)port; (void)proto; (void)base; return NULL;
+    struct BsdSession *sess = find_session(base);
+    struct BsdRspHdr  *rsp;
+    UBYTE  protolen, i;
+    LONG   r;
+    UBYTE *data;
+
+    if (!sess) return NULL;
+
+    protolen = 0;
+    if (proto) { while (proto[protolen] && protolen < 15) protolen++; }
+
+    /* args: port(2) protolen(1) proto[] */
+    fill_hdr(sess, BSDOP_GETSERVBYPORT, 3 + protolen);
+    w16(&sess->io_buf[4], (UWORD)port);
+    sess->io_buf[6] = protolen;
+    for (i = 0; i < protolen; i++) sess->io_buf[7 + i] = (UBYTE)proto[i];
+
+    r = do_rpc(sess, base->SysBase, 7 + protolen);
+    if (r < 0) return NULL;
+
+    /* result = port (host order); data = service name bytes (no NUL) */
+    rsp  = (struct BsdRspHdr *)sess->io_buf;
+    data = sess->io_buf + BSD_RSP_HDR_SIZE;
+
+    for (i = 0; i < rsp->datalen && i < 63; i++) sess->sent_name[i] = (BYTE)data[i];
+    sess->sent_name[rsp->datalen < 63 ? rsp->datalen : 63] = 0;
+
+    if (proto) {
+        for (i = 0; i < protolen; i++) sess->sent_proto[i] = proto[i];
+        sess->sent_proto[protolen] = 0;
+    } else {
+        sess->sent_proto[0] = 0;
+    }
+
+    sess->sent.s_port = (int)port;  /* caller passes network-order port; echo it back */
+    return &sess->sent;
 }
 
 /* ---- getprotobyname / getprotobynumber ----------------------------------- */
+/*
+ * Protocol numbers are IANA-standardised and never change, so we resolve
+ * them locally without a Pi round-trip.
+ */
 
-struct protoent *bsd_getprotobyname(STRPTR a0 __asm("a0"),
+static const struct { const char *name; int proto; } _proto_table[] = {
+    { "ip",      0   },
+    { "icmp",    1   },
+    { "igmp",    2   },
+    { "tcp",     6   },
+    { "udp",     17  },
+    { "raw",     255 },
+    { NULL,      0   }
+};
+
+static struct protoent *_fill_pent(struct BsdSession *sess,
+                                   const char *name, int proto)
+{
+    UBYTE i;
+    for (i = 0; name[i] && i < 15; i++) sess->pent_name[i] = name[i];
+    sess->pent_name[i]  = 0;
+    sess->pent.p_proto  = proto;
+    return &sess->pent;
+}
+
+struct protoent *bsd_getprotobyname(STRPTR name __asm("a0"),
                                      struct BsdBase *base __asm("a6"))
-{ (void)a0; (void)base; return NULL; }
+{
+    struct BsdSession *sess = find_session(base);
+    UWORD i;
+    if (!sess || !name) return NULL;
+    for (i = 0; _proto_table[i].name; i++) {
+        const char *p = _proto_table[i].name;
+        const char *n = (const char *)name;
+        UWORD j = 0;
+        while (p[j] && n[j] && p[j] == n[j]) j++;
+        if (!p[j] && !n[j])
+            return _fill_pent(sess, _proto_table[i].name, _proto_table[i].proto);
+    }
+    return NULL;
+}
 
-struct protoent *bsd_getprotobynumber(LONG d0 __asm("d0"),
+struct protoent *bsd_getprotobynumber(LONG proto __asm("d0"),
                                        struct BsdBase *base __asm("a6"))
-{ (void)d0; (void)base; return NULL; }
+{
+    struct BsdSession *sess = find_session(base);
+    UWORD i;
+    if (!sess) return NULL;
+    for (i = 0; _proto_table[i].name; i++) {
+        if (_proto_table[i].proto == (int)proto)
+            return _fill_pent(sess, _proto_table[i].name, _proto_table[i].proto);
+    }
+    return NULL;
+}
 
 /* ---- vsyslog() ----------------------------------------------------------- */
 

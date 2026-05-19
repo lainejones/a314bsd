@@ -122,7 +122,7 @@ at 242 bytes. The caller loops for larger transfers.
 |----------|--------|
 | `ObtainSocket` / `ReleaseSocket` | Returns `EOPNOTSUPP` |
 | `sendmsg` / `recvmsg` | Returns `EOPNOTSUPP` |
-| `getservbyname` / `getservbyport` | Returns NULL (stub) |
+| `getservbyname` / `getservbyport` | ✅ Implemented |
 | `SocketBaseTagList` ERRNOPTR tag | Ignored (use `Errno()`) |
 | HTTPS / TLS | Works if the Amiga has a TLS-capable browser (IBrowse 2.4+); **requires correct system clock** — SSL certificates are date-validated and will fail if the Amiga RTC is wrong |
 
