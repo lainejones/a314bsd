@@ -474,6 +474,12 @@ LONG bsd_recv(LONG fd __asm("d0"), APTR buf __asm("a0"), LONG len __asm("d1"),
         for (i = 0; i < n; i++) dst[total + i] = src[i];
         total += (LONG)n;
 
+        /* If Pi returned fewer bytes than we asked for, the TCP receive
+         * buffer is drained.  Stop now instead of blocking on the next
+         * call — callers like HTTP clients expect recv() to return
+         * whatever is currently available, not to fill the whole buffer. */
+        if (n < want) break;
+
     } while (total < len);
 
     return total;
