@@ -384,6 +384,9 @@ class Session:
             data = await self.run_blocking(sock.recv, maxlen, flags)
             log.debug('[%d] recv -> %d bytes', self.stream_id, len(data))
             await self.send(seq, len(data), data)
+        except socket.timeout:
+            log.debug('[%d] recv timeout (SO_RCVTIMEO)', self.stream_id)
+            await self.send(seq, -35)   # BSD EAGAIN — caller interprets as timeout
         except OSError as e:
             log.debug('[%d] recv OSError errno=%d: %s', self.stream_id, e.errno, e)
             await self.send(seq, -to_bsd_errno(e.errno))
@@ -422,6 +425,9 @@ class Session:
             data, addr = await self.run_blocking(sock.recvfrom, maxlen, flags)
             ab = encode_sockaddr(addr, self.sin_len_fmt)
             await self.send(seq, len(data), data + bytes([len(ab)]) + ab)
+        except socket.timeout:
+            log.debug('[%d] recvfrom timeout (SO_RCVTIMEO)', self.stream_id)
+            await self.send(seq, -35)   # BSD EAGAIN
         except OSError as e:
             await self.send(seq, -to_bsd_errno(e.errno))
 
@@ -435,6 +441,25 @@ class Session:
             return await self.send(seq, -9)
         level, optname = translate_sockopt(level, optname)
         try:
+            # SO_RCVTIMEO / SO_SNDTIMEO: the Amiga sends a big-endian timeval
+            # (4 bytes tv_sec, or 8 bytes tv_sec+tv_usec). Linux setsockopt
+            # expects a native struct timeval whose size varies by platform.
+            # Use Python's sock.settimeout() which is platform-agnostic.
+            if optname in (socket.SO_RCVTIMEO, socket.SO_SNDTIMEO):
+                if optlen >= 8:
+                    tv_sec, tv_usec = struct.unpack('>II', bytes(optval[:8]))
+                elif optlen >= 4:
+                    tv_sec  = struct.unpack('>I', bytes(optval[:4]))[0]
+                    tv_usec = 0
+                else:
+                    return await self.send(seq, -22)
+                timeout = (tv_sec + tv_usec / 1_000_000.0) if (tv_sec or tv_usec) else None
+                sock.settimeout(timeout)
+                log.debug('[%d] SO_%sTIMEO -> settimeout(%s)',
+                          self.stream_id,
+                          'RCV' if optname == socket.SO_RCVTIMEO else 'SND',
+                          timeout)
+                return await self.send(seq, 0)
             if optlen == 4:
                 sock.setsockopt(level, optname, struct.unpack('>I', optval)[0])
             else:
