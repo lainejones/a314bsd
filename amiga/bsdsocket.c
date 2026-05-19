@@ -745,6 +745,11 @@ LONG bsd_waitselect(LONG nfds __asm("d0"),
     w32(&sess->io_buf[22], tv_usec);
 
     r = do_rpc(sess, base->SysBase, 26);
+    /* Always clear output sigmask.  We forward WaitSelect to the Pi which
+     * has no knowledge of Amiga signals.  Without this, callers that pass
+     * sigmask=SIGBREAKF_CTRL_C (0x1000) see the unchanged input value on
+     * return and incorrectly conclude that a break signal fired. */
+    if (sigmask) *sigmask = 0;
     if (r < 0) return -1;
 
     rsp  = (struct BsdRspHdr *)sess->io_buf;
