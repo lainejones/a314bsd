@@ -474,11 +474,16 @@ LONG bsd_recv(LONG fd __asm("d0"), APTR buf __asm("a0"), LONG len __asm("d1"),
         for (i = 0; i < n; i++) dst[total + i] = src[i];
         total += (LONG)n;
 
-        /* If Pi returned fewer bytes than we asked for, the TCP receive
-         * buffer is drained.  Stop now instead of blocking on the next
-         * call — callers like HTTP clients expect recv() to return
-         * whatever is currently available, not to fill the whole buffer. */
-        if (n < want) break;
+        /* MSG_PEEK does not consume data from the socket buffer.
+         * Every repeated call returns the same bytes from the start.
+         * Loop only once so callers get a single consistent snapshot. */
+        if (flags & MSG_PEEK) break;
+
+        /* If Pi returned fewer bytes than requested and MSG_WAITALL is
+         * not set, the TCP receive buffer is now drained.  Return the
+         * partial count so callers (e.g. HTTP) are not forced to block
+         * waiting for data that may not arrive for a long time. */
+        if (n < want && !(flags & MSG_WAITALL)) break;
 
     } while (total < len);
 
