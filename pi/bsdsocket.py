@@ -117,6 +117,28 @@ def translate_sockopt(level, optname):
         return _LINUX_SOL_SOCKET, _AMIGA_TO_LINUX_SO.get(optname, optname)
     return level, optname
 
+# ---- message flag translation: AmiTCP -> Linux -----------------------------
+#
+# Low bits (OOB=1, PEEK=2, DONTROUTE=4, EOR=8, TRUNC=16, CTRUNC=32) are the
+# same on both.  The two that differ:
+#   MSG_WAITALL:  AmiTCP 0x0040  vs  Linux 0x0100
+#   MSG_DONTWAIT: AmiTCP 0x0080  vs  Linux 0x0040
+# Passing AmiTCP values straight to Linux means MSG_WAITALL (0x40) looks like
+# Linux MSG_DONTWAIT (0x40) — non-blocking — exactly the opposite of intended.
+
+_AMIGA_MSG_WAITALL  = 0x0040
+_AMIGA_MSG_DONTWAIT = 0x0080
+_AMIGA_MSG_LOWBITS  = 0x003F   # bits identical between AmiTCP and Linux
+
+def translate_msgflags(amiga_flags):
+    """Translate AmiTCP MSG_* flags to Linux MSG_* flags."""
+    linux_flags  = amiga_flags & _AMIGA_MSG_LOWBITS
+    if amiga_flags & _AMIGA_MSG_WAITALL:
+        linux_flags |= socket.MSG_WAITALL    # 0x0100 on Linux
+    if amiga_flags & _AMIGA_MSG_DONTWAIT:
+        linux_flags |= socket.MSG_DONTWAIT   # 0x0040 on Linux
+    return linux_flags
+
 # ---- errno translation: Linux -> BSD/AmiTCP --------------------------------
 #
 # errno values 1-34 are identical between Linux and BSD.
@@ -363,6 +385,7 @@ class Session:
         sock = self.get(fd)
         if not sock:
             return await self.send(seq, -9)
+        flags = translate_msgflags(flags)
         try:
             n = await self.run_blocking(sock.send, payload, flags)
             log.debug('[%d] send(fd=%d) -> %d bytes', self.stream_id, fd, n)
@@ -375,7 +398,8 @@ class Session:
         if len(args) < 6:
             return await self.send(seq, -22)
         fd, flags, maxlen = struct.unpack('>HHH', args[:6])
-        log.debug('[%d] recv(fd=%d, maxlen=%d, flags=%d)', self.stream_id, fd, maxlen, flags)
+        flags = translate_msgflags(flags)
+        log.debug('[%d] recv(fd=%d, maxlen=%d, flags=0x%x)', self.stream_id, fd, maxlen, flags)
         sock = self.get(fd)
         if not sock:
             log.warning('[%d] recv: fd %d not found in session', self.stream_id, fd)
@@ -387,6 +411,9 @@ class Session:
         except socket.timeout:
             log.debug('[%d] recv timeout (SO_RCVTIMEO)', self.stream_id)
             await self.send(seq, -35)   # BSD EAGAIN — caller interprets as timeout
+        except BlockingIOError:
+            log.debug('[%d] recv EAGAIN (MSG_DONTWAIT, no data)', self.stream_id)
+            await self.send(seq, -35)   # BSD EAGAIN
         except OSError as e:
             log.debug('[%d] recv OSError errno=%d: %s', self.stream_id, e.errno, e)
             await self.send(seq, -to_bsd_errno(e.errno))
@@ -408,6 +435,7 @@ class Session:
         sock = self.get(fd)
         if not sock:
             return await self.send(seq, -9)
+        flags = translate_msgflags(flags)
         try:
             n = await self.run_blocking(sock.sendto, payload, flags, sa)
             await self.send(seq, n)
@@ -418,15 +446,21 @@ class Session:
         if len(args) < 6:
             return await self.send(seq, -22)
         fd, flags, maxlen = struct.unpack('>HHH', args[:6])
+        flags = translate_msgflags(flags)
+        log.debug('[%d] recvfrom(fd=%d, maxlen=%d, flags=0x%x)', self.stream_id, fd, maxlen, flags)
         sock = self.get(fd)
         if not sock:
             return await self.send(seq, -9)
         try:
             data, addr = await self.run_blocking(sock.recvfrom, maxlen, flags)
+            log.debug('[%d] recvfrom -> %d bytes from %s', self.stream_id, len(data), addr)
             ab = encode_sockaddr(addr, self.sin_len_fmt)
             await self.send(seq, len(data), data + bytes([len(ab)]) + ab)
         except socket.timeout:
             log.debug('[%d] recvfrom timeout (SO_RCVTIMEO)', self.stream_id)
+            await self.send(seq, -35)   # BSD EAGAIN
+        except BlockingIOError:
+            log.debug('[%d] recvfrom EAGAIN (MSG_DONTWAIT, no data)', self.stream_id)
             await self.send(seq, -35)   # BSD EAGAIN
         except OSError as e:
             await self.send(seq, -to_bsd_errno(e.errno))
@@ -439,6 +473,8 @@ class Session:
         sock = self.get(fd)
         if not sock:
             return await self.send(seq, -9)
+        log.debug('[%d] setsockopt(fd=%d, level=0x%x, optname=0x%x, optlen=%d)',
+                  self.stream_id, fd, level, optname, optlen)
         level, optname = translate_sockopt(level, optname)
         try:
             # SO_RCVTIMEO / SO_SNDTIMEO: the Amiga sends a big-endian timeval
