@@ -280,13 +280,27 @@ struct BsdBase *bsd_open(struct BsdBase *base)
     struct A314_IORequest *ior;
     ULONG                  attempt;
 
-    /* Clean up sessions left behind by tasks that crashed without calling
-     * CloseLibrary — their pending A314_READ blocks the ring buffer. */
-    cleanup_orphaned_sessions(base, SysBase);
-
+    /*
+     * Allocate the new session BEFORE cleaning up orphaned sessions.
+     *
+     * The a314 device identifies channels by a14_Socket = (ULONG)sess.
+     * cleanup_orphaned_sessions() calls FreeVec(old_sess), which returns
+     * that memory to exec's free list.  A subsequent AllocVec(new_sess)
+     * would then get the same address back — making the new channel's
+     * socket ID identical to the one just torn down.  The a314 device
+     * rejects A314_CONNECT for a socket ID whose channel was just closed,
+     * so every retry fails regardless of how long we wait.
+     *
+     * Allocating first ensures new_sess != old_sess so the device sees a
+     * genuinely fresh channel identifier.
+     */
     sess = (struct BsdSession *)AllocVec(sizeof(struct BsdSession),
                                          MEMF_PUBLIC | MEMF_CLEAR);
     if (!sess) return NULL;
+
+    /* Clean up sessions left behind by tasks that crashed without calling
+     * CloseLibrary — their open a314 channel blocks the ring buffer. */
+    cleanup_orphaned_sessions(base, SysBase);
 
     /*
      * Retry loop for OpenDevice + A314_CONNECT.
@@ -295,8 +309,8 @@ struct BsdBase *bsd_open(struct BsdBase *base)
      * finish its internal teardown before it can handle a new OpenDevice.
      * Fast retries alone are not enough — we need an actual sleep so the
      * device task gets CPU time.  Open dos.library just long enough to
-     * call Delay(3) (~60 ms at 50 Hz, ~50 ms at 60 Hz) between attempts.
-     * The first attempt has no delay so normal (non-crash) opens are fast.
+     * call Delay() between attempts.  The first attempt has no delay so
+     * normal (non-crash) opens are fast.
      */
     port = NULL;
     ior  = NULL;
@@ -305,7 +319,7 @@ struct BsdBase *bsd_open(struct BsdBase *base)
         if (attempt > 0)
         {
             struct Library *DOSBase = OpenLibrary((STRPTR)"dos.library", 0);
-            if (DOSBase) { Delay(25); CloseLibrary(DOSBase); } /* ~500ms */
+            if (DOSBase) { Delay(50); CloseLibrary(DOSBase); } /* ~1s */
         }
 
         port = CreateMsgPort();
