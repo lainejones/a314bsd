@@ -22,6 +22,7 @@
 #include <exec/tasks.h>
 
 #include <proto/exec.h>
+#include <proto/dos.h>
 
 #include <netinclude/sys/socket.h>
 #include <netinclude/sys/select.h>
@@ -290,16 +291,23 @@ struct BsdBase *bsd_open(struct BsdBase *base)
     /*
      * Retry loop for OpenDevice + A314_CONNECT.
      *
-     * After a rapid CloseDevice/OpenDevice cycle the a314 device task may
-     * not have had a scheduling slot to finish its internal teardown.  Each
-     * retry recreates the port and IORequest (cheap exec calls that yield
-     * to other tasks) giving the device time to settle.  Three attempts
-     * covers any transient race; if all fail we return NULL.
+     * After CloseDevice the a314 device task may need scheduler time to
+     * finish its internal teardown before it can handle a new OpenDevice.
+     * Fast retries alone are not enough — we need an actual sleep so the
+     * device task gets CPU time.  Open dos.library just long enough to
+     * call Delay(3) (~60 ms at 50 Hz, ~50 ms at 60 Hz) between attempts.
+     * The first attempt has no delay so normal (non-crash) opens are fast.
      */
     port = NULL;
     ior  = NULL;
-    for (attempt = 0; attempt < 3; attempt++)
+    for (attempt = 0; attempt < 5; attempt++)
     {
+        if (attempt > 0)
+        {
+            struct Library *DOSBase = OpenLibrary((STRPTR)"dos.library", 0);
+            if (DOSBase) { Delay(3); CloseLibrary(DOSBase); }
+        }
+
         port = CreateMsgPort();
         if (!port) { FreeVec(sess); return NULL; }
 
@@ -329,7 +337,7 @@ struct BsdBase *bsd_open(struct BsdBase *base)
         port = NULL; ior = NULL;
     }
 
-    if (!port) { FreeVec(sess); return NULL; } /* all 3 attempts failed */
+    if (!port) { FreeVec(sess); return NULL; } /* all 5 attempts failed */
 
     /* Wire up hostent in the session (pointers never change) */
     sess->haddr_list[0]   = (APTR)&sess->haddr;
