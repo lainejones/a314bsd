@@ -23,7 +23,7 @@ import concurrent.futures
 
 logging.basicConfig(format='%(levelname)s %(asctime)s %(name)s:%(lineno)d: %(message)s')
 log = logging.getLogger('bsdsocket')
-log.setLevel(logging.INFO)
+log.setLevel(logging.WARNING)
 
 A314D_HOST   = 'localhost'
 A314D_PORT   = 7110
@@ -245,6 +245,7 @@ class Session:
         self.svc         = svc           # back-ref for write()
         self.sockets     = {}            # amiga_fd -> socket.socket
         self.nonblock    = set()         # fds set non-blocking
+        self.raw_fds     = set()         # fds that are SOCK_RAW (ping etc.)
         self.next_fd     = 1
         self.sin_len_fmt = False         # True = BSD4.4 sin_len; False = AmiTCP
 
@@ -264,6 +265,7 @@ class Session:
             try: sock.close()
             except Exception: pass
         self.sockets.clear()
+        self.raw_fds.clear()
 
     async def send(self, seq, result, data=b''):
         # Mask result to 32 bits so negative errno values pack as unsigned int.
@@ -291,6 +293,15 @@ class Session:
             return await self.send(seq, -to_bsd_errno(e.errno))
         fd = self.alloc_fd(sock)
         log.debug('[%d] socket(%d,%d,%d) -> fd=%d', self.stream_id, domain, typ, proto, fd)
+        # Raw sockets (SOCK_RAW=3) are used for ping-like tools.  In real
+        # AmiTCP a timer signal interrupts blocking recvfrom with EINTR so the
+        # app can send the next echo request.  Our proxy can't receive Amiga
+        # signals, so we impose a 1-second internal timeout and return EINTR,
+        # which has the same effect.
+        if typ == socket.SOCK_RAW:
+            sock.settimeout(1.0)
+            self.raw_fds.add(fd)
+            log.debug('[%d] SOCK_RAW fd=%d: internal 1s timeout set', self.stream_id, fd)
         await self.send(seq, fd)
 
     async def op_close(self, seq, args):
@@ -299,6 +310,7 @@ class Session:
         fd = struct.unpack('>H', args[:2])[0]
         sock = self.sockets.pop(fd, None)
         self.nonblock.discard(fd)
+        self.raw_fds.discard(fd)
         if sock:
             try: sock.close()
             except Exception: pass
@@ -457,8 +469,14 @@ class Session:
             ab = encode_sockaddr(addr, self.sin_len_fmt)
             await self.send(seq, len(data), data + bytes([len(ab)]) + ab)
         except socket.timeout:
-            log.debug('[%d] recvfrom timeout (SO_RCVTIMEO)', self.stream_id)
-            await self.send(seq, -35)   # BSD EAGAIN
+            if fd in self.raw_fds:
+                # Internal 1-second timeout on raw socket: simulate SIGALRM
+                # interrupting a blocking recvfrom (how real AmiTCP ping works).
+                log.debug('[%d] recvfrom raw timeout -> EINTR', self.stream_id)
+                await self.send(seq, -4)    # BSD EINTR
+            else:
+                log.debug('[%d] recvfrom timeout (SO_RCVTIMEO)', self.stream_id)
+                await self.send(seq, -35)   # BSD EAGAIN
         except BlockingIOError:
             log.debug('[%d] recvfrom EAGAIN (MSG_DONTWAIT, no data)', self.stream_id)
             await self.send(seq, -35)   # BSD EAGAIN
