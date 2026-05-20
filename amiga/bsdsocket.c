@@ -194,6 +194,81 @@ static struct BsdSession *find_session(struct BsdBase *base)
     return NULL;
 }
 
+/* ---- Orphan cleanup ------------------------------------------------------ */
+/*
+ * When an application crashes without calling CloseLibrary, our Close
+ * function is never called, leaving a "zombie" BsdSession in the list
+ * with its a314 device still open.  The pending A314_READ DoIO for that
+ * stream keeps the ring buffer blocked, so the next A314_CONNECT from any
+ * task fails immediately (nothing reaches the Pi).
+ *
+ * Called at the top of bsd_open: scan the sessions list, check exec's
+ * task ready/wait queues, and close any session whose owning task no
+ * longer exists.
+ *
+ * The tricky part: DoIO is safe only when the IORequest's reply port
+ * belongs to the calling task (otherwise Signal() would target the dead
+ * task's stack).  We solve this by temporarily replacing the reply port
+ * with a freshly-created port owned by the current task before issuing
+ * A314_EOS + CloseDevice.  The original orphaned port's signal bit was
+ * allocated in the dead task; that task's memory is gone, so we skip
+ * FreeSignal and free the port memory directly with FreeMem.
+ */
+static void cleanup_orphaned_sessions(struct BsdBase *base,
+                                      struct ExecBase *SysBase)
+{
+    struct Task       *me = FindTask(NULL);
+    struct BsdSession *s, *next;
+    struct Node       *n;
+    BOOL               alive;
+
+    s = (struct BsdSession *)base->sessions.mlh_Head;
+    while (s->node.mln_Succ != NULL)
+    {
+        next = (struct BsdSession *)s->node.mln_Succ;
+
+        if (s->task == me) { s = next; continue; } /* current task: skip */
+
+        /* Check exec task lists — must Forbid while scanning. */
+        Forbid();
+        alive = FALSE;
+        for (n = SysBase->TaskReady.lh_Head; !alive && n->ln_Succ; n = n->ln_Succ)
+            if ((struct Task *)n == s->task) alive = TRUE;
+        for (n = SysBase->TaskWait.lh_Head; !alive && n->ln_Succ; n = n->ln_Succ)
+            if ((struct Task *)n == s->task) alive = TRUE;
+        Permit();
+
+        if (!alive)
+        {
+            struct MsgPort *tmp;
+
+            Remove((struct Node *)&s->node);
+
+            /* Replace orphaned reply port so DoIO signals the current task. */
+            tmp = CreateMsgPort();
+            if (tmp)
+            {
+                s->ior->a314_Request.io_Message.mn_ReplyPort = tmp;
+                s->ior->a314_Request.io_Command = A314_EOS;
+                DoIO((struct IORequest *)s->ior);  /* tell Pi stream is done */
+                DeleteMsgPort(tmp);
+            }
+            CloseDevice((struct IORequest *)s->ior);
+            DeleteIORequest((struct IORequest *)s->ior);
+
+            /* The original port's AllocSignal was charged to the dead task.
+             * Calling DeleteMsgPort would FreeSignal into freed memory.
+             * Skip straight to FreeMem — the signal bit is already gone. */
+            FreeMem(s->port, sizeof(struct MsgPort));
+
+            FreeVec(s);
+            base->lib.lib_OpenCnt--;
+        }
+
+        s = next;
+    }
+}
+
 /* ---- Open/Close ---------------------------------------------------------- */
 
 struct BsdBase *bsd_open(struct BsdBase *base)
@@ -201,6 +276,10 @@ struct BsdBase *bsd_open(struct BsdBase *base)
     struct ExecBase      *SysBase = base->SysBase;
     struct BsdSession    *sess;
     struct MsgPort       *port;
+
+    /* Clean up sessions left behind by tasks that crashed without calling
+     * CloseLibrary — their pending A314_READ blocks the ring buffer. */
+    cleanup_orphaned_sessions(base, SysBase);
     struct A314_IORequest *ior;
 
     sess = (struct BsdSession *)AllocVec(sizeof(struct BsdSession),
