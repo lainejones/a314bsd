@@ -273,46 +273,63 @@ static void cleanup_orphaned_sessions(struct BsdBase *base,
 
 struct BsdBase *bsd_open(struct BsdBase *base)
 {
-    struct ExecBase      *SysBase = base->SysBase;
-    struct BsdSession    *sess;
-    struct MsgPort       *port;
+    struct ExecBase       *SysBase = base->SysBase;
+    struct BsdSession     *sess;
+    struct MsgPort        *port;
+    struct A314_IORequest *ior;
+    ULONG                  attempt;
 
     /* Clean up sessions left behind by tasks that crashed without calling
      * CloseLibrary — their pending A314_READ blocks the ring buffer. */
     cleanup_orphaned_sessions(base, SysBase);
-    struct A314_IORequest *ior;
 
     sess = (struct BsdSession *)AllocVec(sizeof(struct BsdSession),
                                          MEMF_PUBLIC | MEMF_CLEAR);
     if (!sess) return NULL;
 
-    port = CreateMsgPort();
-    if (!port) { FreeVec(sess); return NULL; }
+    /*
+     * Retry loop for OpenDevice + A314_CONNECT.
+     *
+     * After a rapid CloseDevice/OpenDevice cycle the a314 device task may
+     * not have had a scheduling slot to finish its internal teardown.  Each
+     * retry recreates the port and IORequest (cheap exec calls that yield
+     * to other tasks) giving the device time to settle.  Three attempts
+     * covers any transient race; if all fail we return NULL.
+     */
+    port = NULL;
+    ior  = NULL;
+    for (attempt = 0; attempt < 3; attempt++)
+    {
+        port = CreateMsgPort();
+        if (!port) { FreeVec(sess); return NULL; }
 
-    ior = (struct A314_IORequest *)CreateIORequest(port,
-                                    sizeof(struct A314_IORequest));
-    if (!ior) { DeleteMsgPort(port); FreeVec(sess); return NULL; }
+        ior = (struct A314_IORequest *)CreateIORequest(port,
+                                        sizeof(struct A314_IORequest));
+        if (!ior) { DeleteMsgPort(port); FreeVec(sess); return NULL; }
 
-    if (OpenDevice((STRPTR)A314_NAME, 0, (struct IORequest *)ior, 0) != 0) {
-        DeleteIORequest((struct IORequest *)ior);
-        DeleteMsgPort(port);
-        FreeVec(sess);
-        return NULL;
-    }
+        if (OpenDevice((STRPTR)A314_NAME, 0, (struct IORequest *)ior, 0) != 0) {
+            DeleteIORequest((struct IORequest *)ior);
+            DeleteMsgPort(port);
+            port = NULL; ior = NULL;
+            continue;
+        }
 
-    /* Connect to bsdsocket service on the Pi */
-    ior->a314_Socket              = (ULONG)sess; /* unique per session */
-    ior->a314_Buffer              = (STRPTR)"bsdsocket";
-    ior->a314_Length              = 9;
-    ior->a314_Request.io_Command  = A314_CONNECT;
+        /* Connect to bsdsocket service on the Pi */
+        ior->a314_Socket             = (ULONG)sess;
+        ior->a314_Buffer             = (STRPTR)"bsdsocket";
+        ior->a314_Length             = 9;
+        ior->a314_Request.io_Command = A314_CONNECT;
 
-    if (DoIO((struct IORequest *)ior) != A314_CONNECT_OK) {
+        if (DoIO((struct IORequest *)ior) == A314_CONNECT_OK)
+            break; /* connected */
+
         CloseDevice((struct IORequest *)ior);
         DeleteIORequest((struct IORequest *)ior);
         DeleteMsgPort(port);
-        FreeVec(sess);
-        return NULL;
+        port = NULL; ior = NULL;
     }
+
+    if (!port) { FreeVec(sess); return NULL; } /* all 3 attempts failed */
 
     /* Wire up hostent in the session (pointers never change) */
     sess->haddr_list[0]   = (APTR)&sess->haddr;
