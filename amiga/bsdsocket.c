@@ -420,21 +420,54 @@ LONG bsd_send(LONG fd __asm("d0"), APTR buf __asm("a0"), LONG len __asm("d1"),
     struct ExecBase   *SysBase = base->SysBase;
     struct BsdSession *sess    = find_session(base);
     UBYTE *src;
+    LONG   total, r;
     UWORD  ulen, alen, i;
     (void)SysBase;
     if (!sess || len <= 0) return (len == 0) ? 0 : -1;
 
-    /* Cap at the A314 per-message limit */
-    ulen = (len > BSD_MAX_DATA_SEND) ? BSD_MAX_DATA_SEND : (UWORD)len;
-    alen = 6 + ulen; /* fd(2) flags(2) datalen(2) data[] */
+    /*
+     * Loop to handle HTTP requests (and any payload) larger than
+     * BSD_MAX_DATA_SEND (242 bytes) per A314 message.  Without this loop,
+     * a request larger than 242 bytes is truncated: bsd_send returns 242,
+     * the application thinks all data was sent, the server receives an
+     * incomplete request (no trailing \r\n\r\n), waits, then closes.
+     *
+     * This mirrors the recv loop in bsd_recv which exists for the same
+     * reason (smb2fs large reads).
+     *
+     * On error with no bytes yet → return error.
+     * On error after partial data → return partial count (POSIX semantics).
+     * If Pi returns fewer bytes than requested (non-blocking buffer full) →
+     *   stop looping so the caller can react to the short send.
+     */
+    src   = (UBYTE *)buf;
+    total = 0;
 
-    fill_hdr(sess, BSDOP_SEND, alen);
-    w16(&sess->io_buf[4], (UWORD)fd);
-    w16(&sess->io_buf[6], (UWORD)flags);
-    w16(&sess->io_buf[8], ulen);
-    src = (UBYTE *)buf;
-    for (i = 0; i < ulen; i++) sess->io_buf[10 + i] = src[i];
-    return RPC_RET(do_rpc(sess, base->SysBase, 4 + alen));
+    do {
+        ulen = ((len - total) > (LONG)BSD_MAX_DATA_SEND)
+               ? BSD_MAX_DATA_SEND
+               : (UWORD)(len - total);
+        alen = 6 + ulen; /* fd(2) flags(2) datalen(2) data[] */
+
+        fill_hdr(sess, BSDOP_SEND, alen);
+        w16(&sess->io_buf[4], (UWORD)fd);
+        w16(&sess->io_buf[6], (UWORD)flags);
+        w16(&sess->io_buf[8], ulen);
+        for (i = 0; i < ulen; i++) sess->io_buf[10 + i] = src[total + i];
+
+        r = do_rpc(sess, base->SysBase, 4 + alen);
+        if (r < 0) return (total > 0) ? total : -1;
+
+        total += r;
+
+        /* If Pi forwarded fewer bytes than we asked (non-blocking socket
+         * buffer full, or short write), stop here so the caller sees the
+         * partial count and can retry the rest. */
+        if (r < (LONG)ulen) break;
+
+    } while (total < len);
+
+    return total;
 }
 
 /* ---- recv() -------------------------------------------------------------- */
