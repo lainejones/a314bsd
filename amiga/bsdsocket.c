@@ -114,8 +114,10 @@ static void w32(UBYTE *p, ULONG v)
     p[3] = (UBYTE)(v & 0xFF);
 }
 
-/* Fill the 4-byte request header at io_buf[0..3]. */
-static void fill_hdr(struct BsdSession *sess, UBYTE opcode, UWORD arglen)
+/* Fill the 4-byte request header at io_buf[0..3].
+ * noinline: prevents -O2 from reordering or eliminating the opcode write. */
+static __attribute__((noinline)) void fill_hdr(struct BsdSession *sess,
+                                               UBYTE opcode, UWORD arglen)
 {
     sess->io_buf[0] = opcode;
     sess->io_buf[1] = sess->seq++;
@@ -159,6 +161,20 @@ static LONG do_rpc(struct BsdSession *sess, struct ExecBase *SysBase,
     sess->errno_val = (r < 0) ? -r : 0;
     return r;
 }
+
+/* Normalize do_rpc() to standard BSD return conventions.
+ * errno is already set by do_rpc(); just clamp negative to -1.
+ *   RPC_RET  — for calls that return fd / byte-count on success
+ *   RPC_ZERO — for calls that return 0 on success
+ *
+ * IMPORTANT: implemented as static inline functions, NOT macros.
+ * A macro form like ((r)<0?-1:(r)) would evaluate the argument TWICE
+ * when r >= 0, causing do_rpc() to be called a second time with stale
+ * io_buf contents — that's the "opcode=0 mystery packet" bug. */
+static __inline LONG rpc_ret(LONG r)  { return r < 0 ? -1L : r;  }
+static __inline LONG rpc_zero(LONG r) { return r < 0 ? -1L : 0L; }
+#define RPC_RET(r)  rpc_ret(r)
+#define RPC_ZERO(r) rpc_zero(r)
 
 /* ---- Session lookup ------------------------------------------------------ */
 
@@ -298,7 +314,7 @@ LONG bsd_socket(LONG domain __asm("d0"), LONG type __asm("d1"),
     w16(&sess->io_buf[4], (UWORD)domain);
     w16(&sess->io_buf[6], (UWORD)type);
     w16(&sess->io_buf[8], (UWORD)proto);
-    return do_rpc(sess, base->SysBase, 10);
+    return RPC_RET(do_rpc(sess, base->SysBase, 10));
 }
 
 /* ---- bind() -------------------------------------------------------------- */
@@ -321,7 +337,7 @@ LONG bsd_bind(LONG fd __asm("d0"), APTR sa __asm("a0"), LONG addrlen __asm("d1")
     *p++ = (UBYTE)addrlen;
     src = (UBYTE *)sa;
     for (i = 0; i < (UWORD)addrlen; i++) *p++ = src[i];
-    return do_rpc(sess, base->SysBase, 4 + alen);
+    return RPC_ZERO(do_rpc(sess, base->SysBase, 4 + alen));
 }
 
 /* ---- listen() ------------------------------------------------------------ */
@@ -337,7 +353,7 @@ LONG bsd_listen(LONG fd __asm("d0"), LONG backlog __asm("d1"),
     fill_hdr(sess, BSDOP_LISTEN, 4);
     w16(&sess->io_buf[4], (UWORD)fd);
     w16(&sess->io_buf[6], (UWORD)backlog);
-    return do_rpc(sess, base->SysBase, 8);
+    return RPC_ZERO(do_rpc(sess, base->SysBase, 8));
 }
 
 /* ---- accept() ------------------------------------------------------------ */
@@ -393,7 +409,7 @@ LONG bsd_connect(LONG fd __asm("d0"), APTR sa __asm("a0"), LONG addrlen __asm("d
     *p++ = (UBYTE)addrlen;
     src = (UBYTE *)sa;
     for (i = 0; i < (UWORD)addrlen; i++) *p++ = src[i];
-    return do_rpc(sess, base->SysBase, 4 + alen);
+    return RPC_ZERO(do_rpc(sess, base->SysBase, 4 + alen));
 }
 
 /* ---- send() -------------------------------------------------------------- */
@@ -418,7 +434,7 @@ LONG bsd_send(LONG fd __asm("d0"), APTR buf __asm("a0"), LONG len __asm("d1"),
     w16(&sess->io_buf[8], ulen);
     src = (UBYTE *)buf;
     for (i = 0; i < ulen; i++) sess->io_buf[10 + i] = src[i];
-    return do_rpc(sess, base->SysBase, 4 + alen);
+    return RPC_RET(do_rpc(sess, base->SysBase, 4 + alen));
 }
 
 /* ---- recv() -------------------------------------------------------------- */
@@ -521,7 +537,7 @@ LONG bsd_sendto(LONG fd __asm("d0"), APTR buf __asm("a0"), LONG len __asm("d1"),
     w16(p, ulen); p += 2;
     src = (UBYTE *)buf;
     for (i = 0; i < ulen; i++) *p++ = src[i];
-    return do_rpc(sess, base->SysBase, 4 + alen);
+    return RPC_RET(do_rpc(sess, base->SysBase, 4 + alen));
 }
 
 /* ---- recvfrom() ---------------------------------------------------------- */
@@ -581,7 +597,7 @@ LONG bsd_shutdown(LONG fd __asm("d0"), LONG how __asm("d1"),
     fill_hdr(sess, BSDOP_SHUTDOWN, 4);
     w16(&sess->io_buf[4], (UWORD)fd);
     w16(&sess->io_buf[6], (UWORD)how);
-    return do_rpc(sess, base->SysBase, 8);
+    return RPC_ZERO(do_rpc(sess, base->SysBase, 8));
 }
 
 /* ---- setsockopt() -------------------------------------------------------- */
@@ -608,7 +624,7 @@ LONG bsd_setsockopt(LONG fd __asm("d0"), LONG level __asm("d1"), LONG optname __
     w16(p, uoptlen);        p += 2;
     src = (UBYTE *)optval;
     for (i = 0; i < uoptlen; i++) *p++ = src[i];
-    return do_rpc(sess, base->SysBase, 4 + alen);
+    return RPC_ZERO(do_rpc(sess, base->SysBase, 4 + alen));
 }
 
 /* ---- getsockopt() -------------------------------------------------------- */
@@ -707,7 +723,7 @@ LONG bsd_ioctlsocket(LONG fd __asm("d0"), LONG request __asm("d1"),
     w16(&sess->io_buf[4],  (UWORD)fd);
     w32(&sess->io_buf[6],  (ULONG)request);
     w32(&sess->io_buf[10], arg);
-    return do_rpc(sess, base->SysBase, 14);
+    return RPC_ZERO(do_rpc(sess, base->SysBase, 14));
 }
 
 /* ---- closesocket() ------------------------------------------------------- */
@@ -721,7 +737,7 @@ LONG bsd_closesocket(LONG fd __asm("d0"), struct BsdBase *base __asm("a6"))
 
     fill_hdr(sess, BSDOP_CLOSE, 2);
     w16(&sess->io_buf[4], (UWORD)fd);
-    return do_rpc(sess, base->SysBase, 6);
+    return RPC_ZERO(do_rpc(sess, base->SysBase, 6));
 }
 
 /* ---- waitselect() -------------------------------------------------------- */

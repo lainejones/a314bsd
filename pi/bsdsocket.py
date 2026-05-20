@@ -246,14 +246,16 @@ class Session:
         self.sockets     = {}            # amiga_fd -> socket.socket
         self.nonblock    = set()         # fds set non-blocking
         self.raw_fds     = set()         # fds that are SOCK_RAW (ping etc.)
-        self.next_fd     = 1
         self.sin_len_fmt = False         # True = BSD4.4 sin_len; False = AmiTCP
 
     def alloc_fd(self, sock):
-        fd = self.next_fd
+        # Always reuse the lowest available fd so that fds stay small (1-31)
+        # and never overflow the Amiga's 32-bit fd_set bitmask.  A monotonic
+        # high-water mark would exceed fd=31 after ~32 connections and cause
+        # WaitSelect to silently drop the fd from its select() call.
+        fd = 1
         while fd in self.sockets:
             fd += 1
-        self.next_fd = fd + 1
         self.sockets[fd] = sock
         return fd
 
@@ -336,6 +338,16 @@ class Session:
             log.debug('[%d] connect(fd=%d, %s) -> OK', self.stream_id, fd, sa)
             await self.send(seq, 0)
         except OSError as e:
+            if e.errno == 115:  # EINPROGRESS — non-blocking connect started
+                # Return EINPROGRESS immediately.  The caller (AmiSpeedTest
+                # openConnection) then calls WaitSelect to wait for writability,
+                # which our op_waitselect handles via select() on the Pi socket.
+                # The Pi socket is already connecting in the background; select
+                # will return it writable once the TCP handshake completes.
+                log.debug('[%d] connect(fd=%d, %s) -> EINPROGRESS (non-blocking)',
+                          self.stream_id, fd, sa)
+                await self.send(seq, -36)  # BSD EINPROGRESS
+                return
             log.debug('[%d] connect(fd=%d, %s) -> OSError errno=%d (%s)',
                       self.stream_id, fd, sa, e.errno, e.strerror)
             await self.send(seq, -to_bsd_errno(e.errno))
@@ -583,6 +595,7 @@ class Session:
             return await self.send(seq, -22)
         fd = struct.unpack('>H', args[:2])[0]
         request, arg = struct.unpack('>II', args[2:10])
+        log.debug('[%d] ioctl(fd=%d, request=0x%x, arg=0x%x)', self.stream_id, fd, request, arg)
         sock = self.get(fd)
         if not sock:
             return await self.send(seq, -9)
@@ -784,7 +797,9 @@ class Session:
             if handler:
                 await handler(seq, args)
             else:
-                log.warning('[%d] unknown opcode %d', self.stream_id, opcode)
+                log.warning('[%d] unknown opcode %d seq=%d arglen=%d payload=%s',
+                            self.stream_id, opcode, seq, arglen,
+                            payload.hex())
                 await self.send(seq, -45)   # EOPNOTSUPP
         except Exception:
             log.exception('[%d] dispatch unhandled exception (opcode=%d seq=%d)',
