@@ -305,7 +305,7 @@ struct BsdBase *bsd_open(struct BsdBase *base)
         if (attempt > 0)
         {
             struct Library *DOSBase = OpenLibrary((STRPTR)"dos.library", 0);
-            if (DOSBase) { Delay(3); CloseLibrary(DOSBase); }
+            if (DOSBase) { Delay(25); CloseLibrary(DOSBase); } /* ~500ms */
         }
 
         port = CreateMsgPort();
