@@ -677,26 +677,17 @@ LONG bsd_recv(LONG fd __asm("d0"), APTR buf __asm("a0"), LONG len __asm("d1"),
          * Loop only once so callers get a single consistent snapshot. */
         if (flags & MSG_PEEK) break;
 
-        /* Short-read handling: Pi returned fewer bytes than we asked for.
+        /* POSIX semantics: a blocking recv() returns as soon as any data is
+         * available — it does NOT guarantee filling the caller's buffer.
+         * Only MSG_WAITALL may loop to accumulate all len bytes.
          *
-         * Non-blocking socket (FIONBIO set): the TCP receive buffer is
-         * drained right now — return what we have and let the caller use
-         * WaitSelect to wait for more.  Same semantics as a real non-
-         * blocking recv() that would return EAGAIN on the next call.
-         *
-         * Blocking socket: a short read just means the Pi's local TCP
-         * buffer had fewer than 245 bytes queued at that instant (one
-         * small TCP segment arrived, others are still in flight).  More
-         * data is coming, so keep looping.  Breaking here gives the
-         * caller only a fraction of the requested bytes; speed-test
-         * programs that call recv(fd, buf, N, 0) once and use the return
-         * value for throughput calculation see near-zero download speeds.
-         *
-         * MSG_WAITALL always loops regardless of blocking mode (existing
-         * behaviour, unchanged). */
-        if (n < want && !(flags & MSG_WAITALL))
-            if ((ULONG)fd < 32UL && (sess->nonblock_fds & (1UL << (ULONG)fd)))
-                break;
+         * Looping unconditionally for blocking sockets was wrong: it kept
+         * calling do_rpc after the server finished sending (e.g. at HTTP
+         * EOF), causing the Pi's sock.recv() to block (keep-alive) or
+         * return stale data, breaking downloads with an assertion failure
+         * in wget's progress code (percentage > 100). */
+        if (!(flags & MSG_WAITALL))
+            break;
 
     } while (total < len);
 
