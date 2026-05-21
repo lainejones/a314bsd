@@ -1424,18 +1424,43 @@ ULONG bsd_gethostid(struct BsdBase *base __asm("a6"))
  * GetSysTime is NOT in exec.library.  It lives in timer.device at LVO -66
  * (_LVOGetSysTime EQU -66, TimerBase = the device pointer from a timerequest).
  *
- * We locate timer.device via Forbid/FindName/Permit — exec opens it at boot
- * and it never closes, so the pointer is valid for the entire session.
- * This avoids a full OpenDevice/IORequest setup.
+ * We open timer.device once via the proper OpenDevice API (which is what every
+ * real AmigaOS library does) and cache the base pointer.  The previous
+ * FindName() shortcut could silently return NULL if the device list was not
+ * yet fully initialised or if it found the wrong node — OpenDevice() is
+ * guaranteed to succeed once the device is loaded and correctly sets
+ * ior->io_Device to the timer base.
+ *
+ * We keep the device open for the library's lifetime (which is forever on
+ * AmigaOS — our Expunge never fires) so the reference count stays > 0.
+ * Calling GetSysTime without re-opening would also be fine (it reads hardware),
+ * but keeping it open is cleaner.
+ *
+ * NOTE: GetSysTime (LVO -66) fills both tv_secs and tv_micro regardless of
+ * which UNIT the device was opened with; UNIT_VBLANK (=1) is safe everywhere.
  */
-static struct Library *s_TimerBase = NULL;
+static struct Library  *s_TimerBase = NULL;
+static struct MsgPort  *s_TimerPort = NULL;
+static struct IORequest s_TimerReq;   /* kept open; 32 bytes, enough for OpenDevice */
 
 static void find_timer_base(struct ExecBase *SysBase)
 {
     if (s_TimerBase) return;
-    Forbid();
-    s_TimerBase = (struct Library *)FindName(&SysBase->DeviceList, "timer.device");
-    Permit();
+
+    s_TimerPort = CreateMsgPort();
+    if (!s_TimerPort) return;
+
+    s_TimerReq.io_Message.mn_ReplyPort = s_TimerPort;
+    s_TimerReq.io_Message.mn_Length    = sizeof(s_TimerReq);
+
+    /* UNIT_VBLANK = 1 — works on all Kickstart versions */
+    if (OpenDevice((STRPTR)"timer.device", 1UL,
+                   &s_TimerReq, 0) != 0) {
+        DeleteMsgPort(s_TimerPort);
+        s_TimerPort = NULL;
+        return;
+    }
+    s_TimerBase = (struct Library *)s_TimerReq.io_Device;
 }
 
 /* ---- gettimeofday shim handed to apps via SBTC_GETTIMEOFDAY -------------- */
@@ -1475,8 +1500,9 @@ static LONG bsd_gettimeofday_fn(struct timeval *tv, APTR tz)
  *       high-resolution timing.  Without this, download speed displays
  *       garble (start-time remains zero / uninitialized).
  *
- *   SBTM_SETREF(SBTC_ERRNOLONGPTR)  0x80010006
- *   SBTM_SETREF(SBTC_ERRNO)         0x80010004
+ *   SBTM_SETREF(SBTC_ERRNOLONGPTR)  0x80010006  (Miami fmt, SBTC_ERRNOLONGPTR=6)
+ *   SBTM_SETREF(SBTC_ERRNO)         0x80010004  (Miami fmt, SBTC_ERRNO=4)
+ *   SBTM_SETREF(SBTC_ERRNOLONGPTR)  0x80008031  (AmiTCP fmt, SBTC_ERRNOLONGPTR=24)
  *       ti_Data = address of a LONG errno cell.
  *       We store it in the session; do_rpc() writes errno there after every
  *       call so the app sees it without calling Errno().
@@ -1506,8 +1532,9 @@ LONG bsd_socketbasetaglist(APTR taglist __asm("a0"), struct BsdBase *base __asm(
             /* If timer.device not found, leave the pointer unchanged
              * so the app falls back to its own timing. */
         }
-        else if ((tag == 0x80010006UL || tag == 0x80010004UL) && data && sess)
-            sess->errno_ptr = (LONG *)data;              /* SBTC_ERRNOLONGPTR / SBTC_ERRNO */
+        else if ((tag == 0x80010006UL || tag == 0x80010004UL ||
+                  tag == 0x80008031UL) && data && sess)
+            sess->errno_ptr = (LONG *)data;   /* SBTC_ERRNOLONGPTR/SBTC_ERRNO (Miami+AmiTCP) */
     }
     return 0;
 }
