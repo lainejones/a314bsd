@@ -19,6 +19,7 @@
 #include <exec/memory.h>
 #include <exec/io.h>
 #include <exec/ports.h>
+#include <devices/timer.h>
 #include <exec/tasks.h>
 
 #include <proto/exec.h>
@@ -1439,28 +1440,34 @@ ULONG bsd_gethostid(struct BsdBase *base __asm("a6"))
  * NOTE: GetSysTime (LVO -66) fills both tv_secs and tv_micro regardless of
  * which UNIT the device was opened with; UNIT_VBLANK (=1) is safe everywhere.
  */
-static struct Library  *s_TimerBase = NULL;
-static struct MsgPort  *s_TimerPort = NULL;
-static struct IORequest s_TimerReq;   /* kept open; 32 bytes, enough for OpenDevice */
+static struct Library    *s_TimerBase = NULL;
+static struct MsgPort    *s_TimerPort = NULL;
+static struct timerequest s_TimerReq;   /* full 40-byte struct; timer.device may write tr_time */
 
 static void find_timer_base(struct ExecBase *SysBase)
 {
     if (s_TimerBase) return;
 
+    /* --- Try OpenDevice first (definitive open, avoids FindName race) --- */
     s_TimerPort = CreateMsgPort();
-    if (!s_TimerPort) return;
+    if (s_TimerPort) {
+        s_TimerReq.tr_node.io_Message.mn_ReplyPort = s_TimerPort;
+        s_TimerReq.tr_node.io_Message.mn_Length    = sizeof(s_TimerReq);
 
-    s_TimerReq.io_Message.mn_ReplyPort = s_TimerPort;
-    s_TimerReq.io_Message.mn_Length    = sizeof(s_TimerReq);
-
-    /* UNIT_VBLANK = 1 — works on all Kickstart versions */
-    if (OpenDevice((STRPTR)"timer.device", 1UL,
-                   &s_TimerReq, 0) != 0) {
+        /* UNIT_VBLANK = 1 — works on all Kickstart versions */
+        if (OpenDevice((STRPTR)"timer.device", 1UL,
+                       (struct IORequest *)&s_TimerReq, 0) == 0) {
+            s_TimerBase = (struct Library *)s_TimerReq.tr_node.io_Device;
+            return;                  /* success */
+        }
         DeleteMsgPort(s_TimerPort);
         s_TimerPort = NULL;
-        return;
     }
-    s_TimerBase = (struct Library *)s_TimerReq.io_Device;
+
+    /* --- Fallback: peek device node under Forbid (no allocation needed) --- */
+    Forbid();
+    s_TimerBase = (struct Library *)FindName(&SysBase->DeviceList, "timer.device");
+    Permit();
 }
 
 /* ---- gettimeofday shim handed to apps via SBTC_GETTIMEOFDAY -------------- */
