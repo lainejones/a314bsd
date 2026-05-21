@@ -148,8 +148,7 @@ _LINUX_TO_BSD = {
     11:  35,   # EAGAIN / EWOULDBLOCK
     36:  63,   # ENAMETOOLONG
     39:  66,   # ENOTEMPTY
-    114: 37,   # EALREADY
-    115: 36,   # EINPROGRESS
+    40:  62,   # ELOOP          (Linux=40,  BSD=62)
     88:  38,   # ENOTSOCK
     89:  39,   # EDESTADDRREQ
     90:  40,   # EMSGSIZE
@@ -176,7 +175,8 @@ _LINUX_TO_BSD = {
     111: 61,   # ECONNREFUSED
     112: 64,   # EHOSTDOWN
     113: 65,   # EHOSTUNREACH
-    114: 62,   # ELOOP
+    114: 37,   # EALREADY       (Linux=114, BSD=37)
+    115: 36,   # EINPROGRESS    (Linux=115, BSD=36)
 }
 
 def to_bsd_errno(linux_errno):
@@ -273,6 +273,7 @@ class Session:
         self.sockets.clear()
         self.raw_fds.clear()
         self.dgram_icmp_fds.clear()
+        self.recv_totals.clear()
 
     async def send(self, seq, result, data=b''):
         # Mask result to 32 bits so negative errno values pack as unsigned int.
@@ -281,7 +282,7 @@ class Session:
         await self.svc.write(frame)
 
     async def run_blocking(self, fn, *args):
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         return await loop.run_in_executor(self.svc.executor, fn, *args)
 
     # ---- opcode handlers ---------------------------------------------------
@@ -290,8 +291,9 @@ class Session:
         if len(args) < 6:
             return await self.send(seq, -22)
         domain, typ, proto = struct.unpack('>HHH', args[:6])
-        _flags = [False]  # [dgram_icmp_fallback]
+        dgram_icmp = False
         def _do():
+            nonlocal dgram_icmp
             try:
                 sock = socket.socket(domain, typ, proto)
             except PermissionError:
@@ -302,7 +304,7 @@ class Session:
                 # app sees the same layout as a real SOCK_RAW receive.
                 if typ == socket.SOCK_RAW and proto == 1:  # IPPROTO_ICMP=1
                     sock = socket.socket(domain, socket.SOCK_DGRAM, proto)
-                    _flags[0] = True
+                    dgram_icmp = True
                 else:
                     raise
             sock.setblocking(True)
@@ -312,7 +314,6 @@ class Session:
         except OSError as e:
             return await self.send(seq, -to_bsd_errno(e.errno))
         fd = self.alloc_fd(sock)
-        dgram_icmp = _flags[0]
         # Raw sockets (SOCK_RAW or SOCK_DGRAM fallback for ICMP) are used for
         # ping-like tools.  In real AmiTCP a timer signal interrupts blocking
         # recvfrom with EINTR so the app can send the next echo request.  Our
@@ -659,14 +660,13 @@ class Session:
                     self.nonblock.discard(fd)
                 await self.send(seq, 0)
             elif request == FIONREAD:
-                # How many bytes are readable without blocking
+                # How many bytes are readable without blocking.
+                # Use MSG_PEEK so the data stays in the socket buffer.
                 r, _, _ = _select.select([sock], [], [], 0)
                 count = 0
                 if r:
-                    import socket as _s
-                    count = sock.fileno()   # probe via MSG_PEEK
                     try:
-                        data = sock.recv(65536, _s.MSG_PEEK | _s.MSG_DONTWAIT)
+                        data = sock.recv(65536, socket.MSG_PEEK | socket.MSG_DONTWAIT)
                         count = len(data)
                     except Exception:
                         count = 0
