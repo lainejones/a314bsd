@@ -1444,6 +1444,10 @@ static struct Library    *s_TimerBase = NULL;
 static struct MsgPort    *s_TimerPort = NULL;
 static struct timerequest s_TimerReq;   /* full 40-byte struct; timer.device may write tr_time */
 
+/* Monotonic state for bsd_gettimeofday_fn — ensures elapsed > 0 always */
+static ULONG s_mono_sec  = 0;
+static ULONG s_mono_usec = 0;
+
 static void find_timer_base(struct ExecBase *SysBase)
 {
     if (s_TimerBase) return;
@@ -1474,8 +1478,19 @@ static void find_timer_base(struct ExecBase *SysBase)
 
 /*
  * Called directly by application code through a function pointer.
- * Uses timer.device GetSysTime (LVO -66) to fill *tv with current Amiga time.
- * tz is ignored (AmigaOS has no timezone concept).
+ * Uses timer.device GetSysTime (LVO -66) when available, otherwise uses a
+ * monotonic counter.  ALWAYS returns 0 and fills *tv with a strictly
+ * increasing time value — elapsed is NEVER zero between two calls.
+ *
+ * Why the monotonic guarantee matters:
+ *   wget/AmispeedTest call gettimeofday around DNS lookup, connect, and each
+ *   progress update.  If two consecutive calls return the same value (because
+ *   both happened within one VBL tick ≈ 20 ms, or because timer.device failed
+ *   to open), elapsed = 0, and wget computes speed = bytes / 0.  On AmigaOS
+ *   without FPU, software-float division by zero corrupts the AmigaOS math
+ *   library's global exception state.  ALL subsequent float operations then
+ *   produce garbage, including the file-size display "(278K)" → "(23:K)" and
+ *   the internal percentage variable that triggers assert(percentage <= 100).
  *
  * NOTE: GetSysTime is in timer.device, NOT exec.library.  The two LVOs are
  * completely different functions — calling exec at -192 writes garbage into
@@ -1483,16 +1498,39 @@ static void find_timer_base(struct ExecBase *SysBase)
  */
 static LONG bsd_gettimeofday_fn(struct timeval *tv, APTR tz)
 {
+    ULONG sec, usec;
     (void)tz;
-    if (!tv || !s_TimerBase) return -1;
-    {
+    if (!tv) return -1;
+
+    if (s_TimerBase) {
+        /* GetSysTime fills tv in-place; a0 = tv pointer */
         register struct Library *_tb __asm("a6") = s_TimerBase;
         register struct timeval *_a0 __asm("a0") = tv;
         __asm volatile("jsr -66(%%a6)"    /* _LVOGetSysTime, timer.device */
                        : "+r"(_a0)
                        : "r"(_tb)
                        : "d0", "d1", "a1", "cc", "memory");
+        sec  = (ULONG)tv->tv_sec;
+        usec = (ULONG)tv->tv_usec;
+    } else {
+        /* timer.device unavailable — use monotonic counter as source */
+        sec  = s_mono_sec;
+        usec = s_mono_usec;
     }
+
+    /* Guarantee strict monotonic increase: if same as or behind last call,
+     * advance by exactly 1 µs.  This prevents elapsed = 0 in the caller
+     * even when two calls land in the same timer tick or the clock is frozen. */
+    if (sec < s_mono_sec ||
+        (sec == s_mono_sec && usec <= s_mono_usec)) {
+        sec  = s_mono_sec;
+        usec = s_mono_usec + 1UL;
+        if (usec >= 1000000UL) { usec = 0UL; sec++; }
+    }
+    s_mono_sec  = sec;
+    s_mono_usec = usec;
+    tv->tv_sec  = (long)sec;
+    tv->tv_usec = (long)usec;
     return 0;
 }
 
@@ -1534,10 +1572,11 @@ LONG bsd_socketbasetaglist(APTR taglist __asm("a0"), struct BsdBase *base __asm(
 
         if (tag == 0x80010010UL && data) {               /* SBTC_GETTIMEOFDAY */
             find_timer_base(base->SysBase);
-            if (s_TimerBase)
-                *((GtodFn *)data) = bsd_gettimeofday_fn;
-            /* If timer.device not found, leave the pointer unchanged
-             * so the app falls back to its own timing. */
+            /* Always install bsd_gettimeofday_fn regardless of whether
+             * timer.device opened.  The function uses a monotonic counter
+             * as fallback so elapsed is NEVER zero — preventing the
+             * soft-float division-by-zero that corrupts AmigaOS math state. */
+            *((GtodFn *)data) = bsd_gettimeofday_fn;
         }
         else if ((tag == 0x80010006UL || tag == 0x80010004UL ||
                   tag == 0x80008031UL) && data && sess)
