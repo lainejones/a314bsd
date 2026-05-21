@@ -7,7 +7,7 @@
 | itself, then fills in our custom fields.
 
     .equ    VERSION,        4
-    .equ    REVISION,       8
+    .equ    REVISION,       9
 
     | exec/nodes.h
     .equ    LN_TYPE,        8
@@ -74,7 +74,7 @@ LibName:
     .even
 
 IDString:
-    .ascii  "a314bsd bsdsocket.library 4.8 (21.05.2026)"
+    .ascii  "a314bsd bsdsocket.library 4.9 (21.05.2026)"
     .byte   13,10,0
     .even
 
