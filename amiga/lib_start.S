@@ -7,7 +7,7 @@
 | itself, then fills in our custom fields.
 
     .equ    VERSION,        4
-    .equ    REVISION,       1
+    .equ    REVISION,       7
 
     | exec/nodes.h
     .equ    LN_TYPE,        8
@@ -29,10 +29,11 @@
 
     | BsdBase layout (struct Library = 34 bytes, then our fields)
     | See bsdsocket.c for the full C definition.
-    .equ    bsdbase_SysBase,    34
-    .equ    bsdbase_SegList,    38
-    .equ    bsdbase_Sessions,   42  | MinList (12 bytes)
-    .equ    bsdbase_SIZEOF,     56  | rounded up
+    .equ    bsdbase_SysBase,       34
+    .equ    bsdbase_SegList,       38
+    .equ    bsdbase_Sessions,      42  | MinList (12 bytes)
+    .equ    bsdbase_NextSocketId,  54  | ULONG monotonic counter (offset 54)
+    .equ    bsdbase_SIZEOF,        60  | rounded up from 58
 
     | 4 standard funcs + 46 socket LVOs = 50 total, 50*6 = 300
     .equ    LIB_NEGSIZE_VAL,    300
@@ -73,7 +74,7 @@ LibName:
     .even
 
 IDString:
-    .ascii  "a314bsd bsdsocket.library 4.1 (20.05.2026)"
+    .ascii  "a314bsd bsdsocket.library 4.7 (21.05.2026)"
     .byte   13,10,0
     .even
 

@@ -39,6 +39,7 @@ struct BsdBase {
     struct ExecBase *SysBase;
     APTR             SegList;
     struct MinList   sessions;
+    ULONG            next_socket_id; /* monotonic counter; a314_Socket = ++this */
 };
 
 /* ---- Per-opener session -------------------------------------------------- */
@@ -68,6 +69,7 @@ struct BsdSession {
     struct A314_IORequest *ior;
 
     LONG                   errno_val;
+    LONG                  *errno_ptr;  /* caller's errno cell; set by SetErrnoPtr/SocketBaseTagList */
     UBYTE                  seq;
 
     /* protoent result buffer — filled by getprotobyname/getprotobynumber */
@@ -84,6 +86,16 @@ struct BsdSession {
 
     /* inet_ntoa result buffer */
     BYTE                   ntoa_buf[20];
+
+    /* Non-blocking socket bitmask.
+     * Bit N is set when fd N has been put into non-blocking mode via
+     * ioctlsocket(FIONBIO, 1).  Used by bsd_recv() to decide whether a
+     * short read from the Pi means "TCP buffer drained, return now" (non-
+     * blocking) or "loop and get more data" (blocking).  Without this
+     * distinction, speed-test programs that call recv(fd, buf, large, 0)
+     * on a blocking socket only receive one 245-byte A314 chunk and
+     * compute a near-zero download speed. */
+    ULONG                  nonblock_fds;
 
     /* servent result buffers — reused across getservby* calls */
     struct servent         sent;
@@ -160,6 +172,7 @@ static LONG do_rpc(struct BsdSession *sess, struct ExecBase *SysBase,
     rsp = (struct BsdRspHdr *)sess->io_buf;
     r   = rsp->result;   /* packed LONG, big-endian = native on m68k */
     sess->errno_val = (r < 0) ? -r : 0;
+    if (sess->errno_ptr) *sess->errno_ptr = sess->errno_val;
     return r;
 }
 
@@ -245,11 +258,21 @@ static void cleanup_orphaned_sessions(struct BsdBase *base,
 
             Remove((struct Node *)&s->node);
 
-            /* Replace orphaned reply port so DoIO signals the current task. */
+            /* Replace orphaned reply port so DoIO signals the current task.
+             * If the dead task crashed mid-recv, s->ior is still queued in
+             * the a314 device doing A314_READ.  Reusing an in-flight IORequest
+             * for A314_EOS would corrupt the device's internal list.
+             * CheckIO returns NULL while the IO is still pending — abort it
+             * first so the IORequest is free before we send EOS. */
             tmp = CreateMsgPort();
             if (tmp)
             {
                 s->ior->a314_Request.io_Message.mn_ReplyPort = tmp;
+                if (!CheckIO((struct IORequest *)s->ior))
+                {
+                    AbortIO((struct IORequest *)s->ior);
+                    WaitIO((struct IORequest *)s->ior);
+                }
                 s->ior->a314_Request.io_Command = A314_EOS;
                 DoIO((struct IORequest *)s->ior);  /* tell Pi stream is done */
                 DeleteMsgPort(tmp);
@@ -336,8 +359,13 @@ struct BsdBase *bsd_open(struct BsdBase *base)
             continue;
         }
 
-        /* Connect to bsdsocket service on the Pi */
-        ior->a314_Socket             = (ULONG)sess;
+        /* Connect to bsdsocket service on the Pi.
+         * Use a monotonically increasing counter for the socket ID rather than
+         * the session address.  The a314 device rejects A314_CONNECT for a
+         * socket ID it just closed — and exec's free-list returns the same
+         * address on the next AllocVec, so (ULONG)sess repeats immediately
+         * on every second open.  The counter never repeats within one boot. */
+        ior->a314_Socket             = ++base->next_socket_id;
         ior->a314_Buffer             = (STRPTR)"bsdsocket";
         ior->a314_Length             = 9;
         ior->a314_Request.io_Command = A314_CONNECT;
@@ -413,8 +441,11 @@ LONG bsd_errno(struct BsdBase *base __asm("a6"))
 void bsd_seterrnoptr(APTR a0 __asm("a0"), LONG d0 __asm("d0"),
                      struct BsdBase *base __asm("a6"))
 {
-    /* Optional: store caller's errno pointer.  Not implemented. */
-    (void)a0; (void)d0; (void)base;
+    /* Store caller's errno LONG* so do_rpc() writes errno after every call. */
+    struct BsdSession *sess = find_session(base);
+    (void)d0;  /* size — we only support LONG (4-byte) errno */
+    if (sess)
+        sess->errno_ptr = (LONG *)a0;
 }
 
 /* ---- socket() ------------------------------------------------------------ */
@@ -646,11 +677,26 @@ LONG bsd_recv(LONG fd __asm("d0"), APTR buf __asm("a0"), LONG len __asm("d1"),
          * Loop only once so callers get a single consistent snapshot. */
         if (flags & MSG_PEEK) break;
 
-        /* If Pi returned fewer bytes than requested and MSG_WAITALL is
-         * not set, the TCP receive buffer is now drained.  Return the
-         * partial count so callers (e.g. HTTP) are not forced to block
-         * waiting for data that may not arrive for a long time. */
-        if (n < want && !(flags & MSG_WAITALL)) break;
+        /* Short-read handling: Pi returned fewer bytes than we asked for.
+         *
+         * Non-blocking socket (FIONBIO set): the TCP receive buffer is
+         * drained right now — return what we have and let the caller use
+         * WaitSelect to wait for more.  Same semantics as a real non-
+         * blocking recv() that would return EAGAIN on the next call.
+         *
+         * Blocking socket: a short read just means the Pi's local TCP
+         * buffer had fewer than 245 bytes queued at that instant (one
+         * small TCP segment arrived, others are still in flight).  More
+         * data is coming, so keep looping.  Breaking here gives the
+         * caller only a fraction of the requested bytes; speed-test
+         * programs that call recv(fd, buf, N, 0) once and use the return
+         * value for throughput calculation see near-zero download speeds.
+         *
+         * MSG_WAITALL always loops regardless of blocking mode (existing
+         * behaviour, unchanged). */
+        if (n < want && !(flags & MSG_WAITALL))
+            if ((ULONG)fd < 32UL && (sess->nonblock_fds & (1UL << (ULONG)fd)))
+                break;
 
     } while (total < len);
 
@@ -870,6 +916,18 @@ LONG bsd_ioctlsocket(LONG fd __asm("d0"), LONG request __asm("d1"),
     if (!sess) return -1;
 
     arg = argp ? *(ULONG *)argp : 0UL;
+
+    /* Track non-blocking mode locally so bsd_recv() can decide whether
+     * to break on a short read (non-blocking: buffer drained, return now)
+     * or keep looping (blocking: more data is on the way from the server).
+     * FIONBIO = 0x8004667e in AmiTCP (matches BSD/SunOS ioctl encoding). */
+    if ((ULONG)request == 0x8004667eUL && (ULONG)fd < 32UL) {
+        if (arg)
+            sess->nonblock_fds |=  (1UL << (ULONG)fd);
+        else
+            sess->nonblock_fds &= ~(1UL << (ULONG)fd);
+    }
+
     fill_hdr(sess, BSDOP_IOCTL, 10);
     w16(&sess->io_buf[4],  (UWORD)fd);
     w32(&sess->io_buf[6],  (ULONG)request);
@@ -885,6 +943,10 @@ LONG bsd_closesocket(LONG fd __asm("d0"), struct BsdBase *base __asm("a6"))
     struct BsdSession *sess    = find_session(base);
     (void)SysBase;
     if (!sess) return -1;
+
+    /* Clear non-blocking flag when the socket is closed. */
+    if ((ULONG)fd < 32UL)
+        sess->nonblock_fds &= ~(1UL << (ULONG)fd);
 
     fill_hdr(sess, BSDOP_CLOSE, 2);
     w16(&sess->io_buf[4], (UWORD)fd);
@@ -904,7 +966,6 @@ LONG bsd_waitselect(LONG nfds __asm("d0"),
     ULONG  rm, wm, em, tv_sec, tv_usec;
     LONG   r;
     UBYTE *data;
-    (void)SysBase; (void)sigmask;
     if (!sess) return -1;
 
     rm = rfds ? *rfds : 0UL;
@@ -923,11 +984,20 @@ LONG bsd_waitselect(LONG nfds __asm("d0"),
     w32(&sess->io_buf[22], tv_usec);
 
     r = do_rpc(sess, base->SysBase, 26);
-    /* Always clear output sigmask.  We forward WaitSelect to the Pi which
-     * has no knowledge of Amiga signals.  Without this, callers that pass
-     * sigmask=SIGBREAKF_CTRL_C (0x1000) see the unchanged input value on
-     * return and incorrectly conclude that a break signal fired. */
-    if (sigmask) *sigmask = 0;
+    /* Report whichever of the caller's signals fired while we were blocking,
+     * then CLEAR those signal bits — mirroring what exec's Wait() does when
+     * it returns.  Real AmiTCP WaitSelect calls Wait() internally; Wait()
+     * atomically reads and clears the signals that woke it up.  If we only
+     * read (SetSignal(0,0)) without clearing, any signal that fires once
+     * (e.g. SIGF_TIMER) stays set on the task and is returned on EVERY
+     * subsequent WaitSelect call, flooding wget/AmispeedTest with spurious
+     * timer events → near-zero delta_time → wrong speed display.
+     *
+     * SetSignal(0, *sigmask) atomically:
+     *   - clears all bits in *sigmask from the task's signal state
+     *   - returns the previous signal state (before the clear)
+     * Masking with *sigmask gives exactly which requested signals were pending. */
+    if (sigmask) *sigmask = SetSignal(0UL, *sigmask) & *sigmask;
     if (r < 0) return -1;
 
     rsp  = (struct BsdRspHdr *)sess->io_buf;
@@ -1357,10 +1427,99 @@ LONG bsd_gethostname(APTR buf __asm("a0"), LONG buflen __asm("d0"),
 ULONG bsd_gethostid(struct BsdBase *base __asm("a6"))
 { (void)base; return 0; }
 
+/* ---- timer.device base for GetSysTime ------------------------------------- */
+
+/*
+ * GetSysTime is NOT in exec.library.  It lives in timer.device at LVO -66
+ * (_LVOGetSysTime EQU -66, TimerBase = the device pointer from a timerequest).
+ *
+ * We locate timer.device via Forbid/FindName/Permit — exec opens it at boot
+ * and it never closes, so the pointer is valid for the entire session.
+ * This avoids a full OpenDevice/IORequest setup.
+ */
+static struct Library *s_TimerBase = NULL;
+
+static void find_timer_base(struct ExecBase *SysBase)
+{
+    if (s_TimerBase) return;
+    Forbid();
+    s_TimerBase = (struct Library *)FindName(&SysBase->DeviceList, "timer.device");
+    Permit();
+}
+
+/* ---- gettimeofday shim handed to apps via SBTC_GETTIMEOFDAY -------------- */
+
+/*
+ * Called directly by application code through a function pointer.
+ * Uses timer.device GetSysTime (LVO -66) to fill *tv with current Amiga time.
+ * tz is ignored (AmigaOS has no timezone concept).
+ *
+ * NOTE: GetSysTime is in timer.device, NOT exec.library.  The two LVOs are
+ * completely different functions — calling exec at -192 writes garbage into
+ * the timeval and produces garbled speed display.
+ */
+static LONG bsd_gettimeofday_fn(struct timeval *tv, APTR tz)
+{
+    (void)tz;
+    if (!tv || !s_TimerBase) return -1;
+    {
+        register struct Library *_tb __asm("a6") = s_TimerBase;
+        register struct timeval *_a0 __asm("a0") = tv;
+        __asm volatile("jsr -66(%%a6)"    /* _LVOGetSysTime, timer.device */
+                       : "+r"(_a0)
+                       : "r"(_tb)
+                       : "d0", "d1", "a1", "cc", "memory");
+    }
+    return 0;
+}
+
 /* ---- socketbasetaglist() ------------------------------------------------- */
 
-LONG bsd_socketbasetaglist(APTR a0 __asm("a0"), struct BsdBase *base __asm("a6"))
-{ (void)a0; (void)base; return 0; }
+/*
+ * Scans the caller's TagItem list and fulfils recognised tags:
+ *
+ *   SBTM_SETREF(SBTC_GETTIMEOFDAY)  0x80010010
+ *       ti_Data = address of a function-pointer variable.
+ *       We write &bsd_gettimeofday_fn there so the app can call it for
+ *       high-resolution timing.  Without this, download speed displays
+ *       garble (start-time remains zero / uninitialized).
+ *
+ *   SBTM_SETREF(SBTC_ERRNOLONGPTR)  0x80010006
+ *   SBTM_SETREF(SBTC_ERRNO)         0x80010004
+ *       ti_Data = address of a LONG errno cell.
+ *       We store it in the session; do_rpc() writes errno there after every
+ *       call so the app sees it without calling Errno().
+ */
+LONG bsd_socketbasetaglist(APTR taglist __asm("a0"), struct BsdBase *base __asm("a6"))
+{
+    typedef LONG (*GtodFn)(struct timeval *, APTR);
+    struct BsdSession *sess = find_session(base);
+    ULONG *ti = (ULONG *)taglist;
+
+    if (!ti) return 0;
+
+    while (1) {
+        ULONG tag  = ti[0];
+        ULONG data = ti[1];
+        ti += 2;
+
+        if (tag == 0UL) break;                           /* TAG_DONE  */
+        if (tag == 1UL) continue;                        /* TAG_IGNORE */
+        if (tag == 2UL) { ti = (ULONG *)(APTR)data; continue; } /* TAG_MORE */
+        if (tag == 3UL) { ti += data * 2UL; continue; } /* TAG_SKIP  */
+
+        if (tag == 0x80010010UL && data) {               /* SBTC_GETTIMEOFDAY */
+            find_timer_base(base->SysBase);
+            if (s_TimerBase)
+                *((GtodFn *)data) = bsd_gettimeofday_fn;
+            /* If timer.device not found, leave the pointer unchanged
+             * so the app falls back to its own timing. */
+        }
+        else if ((tag == 0x80010006UL || tag == 0x80010004UL) && data && sess)
+            sess->errno_ptr = (LONG *)data;              /* SBTC_ERRNOLONGPTR / SBTC_ERRNO */
+    }
+    return 0;
+}
 
 /* ---- getsocketevents() --------------------------------------------------- */
 
