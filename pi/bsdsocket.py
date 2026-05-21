@@ -23,7 +23,7 @@ import concurrent.futures
 
 logging.basicConfig(format='%(levelname)s %(asctime)s %(name)s:%(lineno)d: %(message)s')
 log = logging.getLogger('bsdsocket')
-log.setLevel(logging.DEBUG)   # TEMP: diagnosing download speed display bug
+log.setLevel(logging.WARNING)
 
 A314D_HOST   = 'localhost'
 A314D_PORT   = 7110
