@@ -1500,11 +1500,11 @@ LONG bsd_socketbasetaglist(APTR taglist __asm("a0"), struct BsdBase *base __asm(
         if (tag == 3UL) { ti += data * 2UL; continue; } /* TAG_SKIP  */
 
         if (tag == 0x80010010UL && data) {               /* SBTC_GETTIMEOFDAY */
-            /* DIAGNOSTIC: do NOT install our gettimeofday callback.
-             * Leave the app's pointer unchanged so it falls back to its
-             * own timing.  This tests whether our GetSysTime call is the
-             * root cause of the soft-float corruption / wget crash. */
-            (void)0;
+            find_timer_base(base->SysBase);
+            if (s_TimerBase)
+                *((GtodFn *)data) = bsd_gettimeofday_fn;
+            /* If timer.device not found, leave the pointer unchanged
+             * so the app falls back to its own timing. */
         }
         else if ((tag == 0x80010006UL || tag == 0x80010004UL) && data && sess)
             sess->errno_ptr = (LONG *)data;              /* SBTC_ERRNOLONGPTR / SBTC_ERRNO */
