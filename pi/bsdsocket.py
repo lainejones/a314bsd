@@ -23,7 +23,7 @@ import concurrent.futures
 
 logging.basicConfig(format='%(levelname)s %(asctime)s %(name)s:%(lineno)d: %(message)s')
 log = logging.getLogger('bsdsocket')
-log.setLevel(logging.WARNING)
+log.setLevel(logging.DEBUG)   # TEMP: diagnosing download speed display bug
 
 A314D_HOST   = 'localhost'
 A314D_PORT   = 7110
@@ -245,8 +245,12 @@ class Session:
         self.svc         = svc           # back-ref for write()
         self.sockets     = {}            # amiga_fd -> socket.socket
         self.nonblock    = set()         # fds set non-blocking
-        self.raw_fds     = set()         # fds that are SOCK_RAW (ping etc.)
-        self.sin_len_fmt = False         # True = BSD4.4 sin_len; False = AmiTCP
+        self.raw_fds      = set()         # fds that are SOCK_RAW (ping etc.)
+        self.dgram_icmp_fds = set()      # SOCK_DGRAM+ICMP fds emulating SOCK_RAW
+                                         # (used when SOCK_RAW fails with EPERM;
+                                         #  recvfrom prepends a synthesised IP hdr)
+        self.sin_len_fmt  = False        # True = BSD4.4 sin_len; False = AmiTCP
+        self.recv_totals = {}            # fd -> cumulative bytes delivered via recv
 
     def alloc_fd(self, sock):
         # Always reuse the lowest available fd so that fds stay small (1-31)
@@ -268,6 +272,7 @@ class Session:
             except Exception: pass
         self.sockets.clear()
         self.raw_fds.clear()
+        self.dgram_icmp_fds.clear()
 
     async def send(self, seq, result, data=b''):
         # Mask result to 32 bits so negative errno values pack as unsigned int.
@@ -285,8 +290,21 @@ class Session:
         if len(args) < 6:
             return await self.send(seq, -22)
         domain, typ, proto = struct.unpack('>HHH', args[:6])
+        _flags = [False]  # [dgram_icmp_fallback]
         def _do():
-            sock = socket.socket(domain, typ, proto)
+            try:
+                sock = socket.socket(domain, typ, proto)
+            except PermissionError:
+                # SOCK_RAW requires CAP_NET_RAW; fall back to SOCK_DGRAM for
+                # ICMP (Linux "ping sockets", allowed by default on RPi OS via
+                # net.ipv4.ping_group_range = 0 2147483647).
+                # recvfrom will prepend a synthesised IP header so the Amiga
+                # app sees the same layout as a real SOCK_RAW receive.
+                if typ == socket.SOCK_RAW and proto == 1:  # IPPROTO_ICMP=1
+                    sock = socket.socket(domain, socket.SOCK_DGRAM, proto)
+                    _flags[0] = True
+                else:
+                    raise
             sock.setblocking(True)
             return sock
         try:
@@ -294,16 +312,24 @@ class Session:
         except OSError as e:
             return await self.send(seq, -to_bsd_errno(e.errno))
         fd = self.alloc_fd(sock)
-        log.debug('[%d] socket(%d,%d,%d) -> fd=%d', self.stream_id, domain, typ, proto, fd)
-        # Raw sockets (SOCK_RAW=3) are used for ping-like tools.  In real
-        # AmiTCP a timer signal interrupts blocking recvfrom with EINTR so the
-        # app can send the next echo request.  Our proxy can't receive Amiga
-        # signals, so we impose a 1-second internal timeout and return EINTR,
-        # which has the same effect.
-        if typ == socket.SOCK_RAW:
+        dgram_icmp = _flags[0]
+        # Raw sockets (SOCK_RAW or SOCK_DGRAM fallback for ICMP) are used for
+        # ping-like tools.  In real AmiTCP a timer signal interrupts blocking
+        # recvfrom with EINTR so the app can send the next echo request.  Our
+        # proxy can't receive Amiga signals, so we impose a 1-second internal
+        # timeout and return EINTR, which has the same effect.
+        if typ == socket.SOCK_RAW or dgram_icmp:
             sock.settimeout(1.0)
             self.raw_fds.add(fd)
-            log.debug('[%d] SOCK_RAW fd=%d: internal 1s timeout set', self.stream_id, fd)
+            if dgram_icmp:
+                self.dgram_icmp_fds.add(fd)
+                log.debug('[%d] socket(%d,%d,%d) -> fd=%d (SOCK_DGRAM fallback for ICMP)',
+                          self.stream_id, domain, typ, proto, fd)
+            else:
+                log.debug('[%d] socket(%d,%d,%d) -> fd=%d (SOCK_RAW)',
+                          self.stream_id, domain, typ, proto, fd)
+        else:
+            log.debug('[%d] socket(%d,%d,%d) -> fd=%d', self.stream_id, domain, typ, proto, fd)
         await self.send(seq, fd)
 
     async def op_close(self, seq, args):
@@ -313,10 +339,12 @@ class Session:
         sock = self.sockets.pop(fd, None)
         self.nonblock.discard(fd)
         self.raw_fds.discard(fd)
+        self.dgram_icmp_fds.discard(fd)
         if sock:
             try: sock.close()
             except Exception: pass
-        log.debug('[%d] close(fd=%d)', self.stream_id, fd)
+        total = self.recv_totals.pop(fd, 0)
+        log.debug('[%d] close(fd=%d) recv_total=%d', self.stream_id, fd, total)
         await self.send(seq, 0)
 
     async def op_connect(self, seq, args):
@@ -430,7 +458,9 @@ class Session:
             return await self.send(seq, -9)
         try:
             data = await self.run_blocking(sock.recv, maxlen, flags)
-            log.debug('[%d] recv -> %d bytes', self.stream_id, len(data))
+            self.recv_totals[fd] = self.recv_totals.get(fd, 0) + len(data)
+            log.debug('[%d] recv fd=%d -> %d bytes (fd total: %d)',
+                      self.stream_id, fd, len(data), self.recv_totals[fd])
             await self.send(seq, len(data), data)
         except socket.timeout:
             log.debug('[%d] recv timeout (SO_RCVTIMEO)', self.stream_id)
@@ -477,7 +507,28 @@ class Session:
             return await self.send(seq, -9)
         try:
             data, addr = await self.run_blocking(sock.recvfrom, maxlen, flags)
-            log.debug('[%d] recvfrom -> %d bytes from %s', self.stream_id, len(data), addr)
+            if fd in self.dgram_icmp_fds:
+                # SOCK_DGRAM+ICMP returns only the ICMP bytes (no IP header).
+                # Prepend a synthesised 20-byte IPv4 header so the Amiga app
+                # sees the same layout it would get from a real SOCK_RAW socket.
+                # Source IP comes from recvfrom's addr tuple; TTL is faked (64).
+                try:
+                    src_ip = socket.inet_aton(addr[0])
+                except OSError:
+                    src_ip = b'\x00\x00\x00\x00'
+                fake_iphdr = struct.pack('>BBHHHBBH4s4s',
+                    0x45, 0,                   # Ver=4 IHL=5, DSCP/ECN=0
+                    20 + len(data),            # Total length
+                    0, 0,                      # ID, Flags+FragOff
+                    64, 1, 0,                  # TTL=64, Proto=ICMP, Checksum=0
+                    src_ip,                    # Source address
+                    b'\x00\x00\x00\x00',       # Dest address (unknown, ignored by ping)
+                )
+                data = fake_iphdr + data
+                log.debug('[%d] recvfrom dgram-icmp -> %d bytes (incl fake iphdr) from %s',
+                          self.stream_id, len(data), addr)
+            else:
+                log.debug('[%d] recvfrom -> %d bytes from %s', self.stream_id, len(data), addr)
             ab = encode_sockaddr(addr, self.sin_len_fmt)
             await self.send(seq, len(data), data + bytes([len(ab)]) + ab)
         except socket.timeout:
@@ -726,6 +777,11 @@ class Session:
         xlist = [self.get(fd) for fd in range(nfds)
                  if (emask >> fd) & 1 and self.get(fd)]
 
+        log.debug('[%d] WaitSelect nfds=%d rmask=0x%x wmask=0x%x emask=0x%x '
+                  'timeout=%s rlist=%d wlist=%d xlist=%d',
+                  self.stream_id, nfds, rmask, wmask, emask,
+                  timeout, len(rlist), len(wlist), len(xlist))
+
         def _do():
             return _select.select(rlist, wlist, xlist, timeout)
 
@@ -742,7 +798,12 @@ class Session:
             return m
 
         nr = len(r) + len(w) + len(x)
-        data = struct.pack('>III', to_mask(r), to_mask(w), to_mask(x))
+        rm_out = to_mask(r)
+        wm_out = to_mask(w)
+        em_out = to_mask(x)
+        log.debug('[%d] WaitSelect -> nr=%d rmask_out=0x%x wmask_out=0x%x emask_out=0x%x',
+                  self.stream_id, nr, rm_out, wm_out, em_out)
+        data = struct.pack('>III', rm_out, wm_out, em_out)
         await self.send(seq, nr, data)
 
     async def op_gethostname(self, seq, args):
