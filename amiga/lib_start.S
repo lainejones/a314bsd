@@ -7,7 +7,12 @@
 | itself, then fills in our custom fields.
 
     .equ    VERSION,        4
-    .equ    REVISION,       13
+    | Internally this is the v5.0 architectural rewrite (dispatcher task +
+    | chunked-data streaming + one Wait per caller-task call), but VERSION
+    | stays at 4 to preserve OpenLibrary compatibility for apps that asked
+    | for V4 against the old codebase.  REVISION jumps to 50 to clearly
+    | differentiate from the previous v4.42.
+    .equ    REVISION,       53
 
     | exec/nodes.h
     .equ    LN_TYPE,        8
@@ -35,8 +40,12 @@
     .equ    bsdbase_NextSocketId,  54  | ULONG monotonic counter (offset 54)
     .equ    bsdbase_SIZEOF,        60  | rounded up from 58
 
-    | 4 standard funcs + 46 socket LVOs = 50 total, 50*6 = 300
-    .equ    LIB_NEGSIZE_VAL,    300
+    | v4.366: extend table to match Roadshow's full LVO range.
+    | 4 std + 46 implemented + 87 stub = 137 entries, 137*6 = 822
+    | Stubs return 0 / NULL so wget's feature-probe paths see "function failed,
+    | fall back to legacy".  Without this any wget call past LVO -300 would
+    | JSR into junk memory and crash.
+    .equ    LIB_NEGSIZE_VAL,    822
 
     | exec LVO offsets — confirmed from pragmas/exec_pragmas.h
     | #pragma syscall MakeLibrary 54 ...   → LVO -0x54 = -84
@@ -74,7 +83,9 @@ LibName:
     .even
 
 IDString:
-    .ascii  "a314bsd bsdsocket.library 4.13 (21.05.2026)"
+    | NOTE: the AmigaDOS `version` command reads this string (not lib_Revision)
+    | to report the version number, so the "4.NN" here MUST match REVISION above.
+    .ascii  "a314bsd bsdsocket.library 4.53 (23.05.2026)"
     .byte   13,10,0
     .even
 
@@ -133,6 +144,98 @@ FuncTable:
     .long   _bsd_gethostid          | -288
     .long   _bsd_socketbasetaglist  | -294
     .long   _bsd_getsocketevents    | -300
+    | --- Roadshow LVOs -306..-822 stubbed to StubRetZero (87 entries) ---
+    | These cover bpf_*, route mgmt, interface mgmt, netmonitor, DNS server
+    | mgmt, *net*ent iterators, inet_aton/ntop/pton, mbuf_*, server APIs,
+    | Roadshow data, gethostbyname_r, freeaddrinfo, getaddrinfo, gai_strerror,
+    | getnameinfo, etc.  All return 0 so callers see "unsupported / failed".
+    .long   StubRetZero | -306
+    .long   StubRetZero | -312
+    .long   StubRetZero | -318
+    .long   StubRetZero | -324
+    .long   StubRetZero | -330
+    .long   StubRetZero | -336
+    .long   StubRetZero | -342
+    .long   StubRetZero | -348
+    .long   StubRetZero | -354
+    .long   StubRetZero | -360
+    .long   StubRetZero | -366  bpf_open
+    .long   StubRetZero | -372  bpf_close
+    .long   StubRetZero | -378  bpf_read
+    .long   StubRetZero | -384  bpf_write
+    .long   StubRetZero | -390  bpf_set_notify_mask
+    .long   StubRetZero | -396  bpf_set_interrupt_mask
+    .long   StubRetZero | -402  bpf_ioctl
+    .long   StubRetZero | -408  bpf_data_waiting
+    .long   StubRetZero | -414  AddRouteTagList
+    .long   StubRetZero | -420  DeleteRouteTagList
+    .long   StubRetZero | -426
+    .long   StubRetZero | -432  FreeRouteInfo
+    .long   StubRetZero | -438  GetRouteInfo
+    .long   StubRetZero | -444  AddInterfaceTagList
+    .long   StubRetZero | -450  ConfigureInterfaceTagList
+    .long   StubRetZero | -456  ReleaseInterfaceList
+    .long   StubRetZero | -462  ObtainInterfaceList
+    .long   StubRetZero | -468  QueryInterfaceTagList
+    .long   StubRetZero | -474  CreateAddrAllocMessageA
+    .long   StubRetZero | -480  DeleteAddrAllocMessage
+    .long   StubRetZero | -486  BeginInterfaceConfig
+    .long   StubRetZero | -492  AbortInterfaceConfig
+    .long   StubRetZero | -498  AddNetMonitorHookTagList
+    .long   StubRetZero | -504  RemoveNetMonitorHook
+    .long   StubRetZero | -510  GetNetworkStatistics
+    .long   StubRetZero | -516  AddDomainNameServer
+    .long   StubRetZero | -522  RemoveDomainNameServer
+    .long   StubRetZero | -528  ReleaseDomainNameServerList
+    .long   StubRetZero | -534  ObtainDomainNameServerList
+    .long   StubRetZero | -540  setnetent
+    .long   StubRetZero | -546  endnetent
+    .long   StubRetZero | -552  getnetent
+    .long   StubRetZero | -558  setprotoent
+    .long   StubRetZero | -564  endprotoent
+    .long   StubRetZero | -570  getprotoent
+    .long   StubRetZero | -576  setservent
+    .long   StubRetZero | -582  endservent
+    .long   StubRetZero | -588  getservent
+    .long   StubRetZero | -594  inet_aton
+    .long   StubRetZero | -600  inet_ntop
+    .long   StubRetZero | -606  inet_pton
+    .long   StubRetZero | -612  In_LocalAddr
+    .long   StubRetZero | -618  In_CanForward
+    .long   StubRetZero | -624  mbuf_copym
+    .long   StubRetZero | -630  mbuf_copyback
+    .long   StubRetZero | -636  mbuf_copydata
+    .long   StubRetZero | -642  mbuf_free
+    .long   StubRetZero | -648  mbuf_freem
+    .long   StubRetZero | -654  mbuf_get
+    .long   StubRetZero | -660  mbuf_gethdr
+    .long   StubRetZero | -666  mbuf_prepend
+    .long   StubRetZero | -672  mbuf_cat
+    .long   StubRetZero | -678  mbuf_adj
+    .long   StubRetZero | -684  mbuf_pullup
+    .long   StubRetZero | -690  ProcessIsServer
+    .long   StubRetZero | -696  ObtainServerSocket
+    .long   StubRetZero | -702  GetDefaultDomainName
+    .long   StubRetZero | -708  SetDefaultDomainName
+    .long   StubRetZero | -714  ObtainRoadshowData
+    .long   StubRetZero | -720  ReleaseRoadshowData
+    .long   StubRetZero | -726  ChangeRoadshowData
+    .long   StubRetZero | -732  RemoveInterface
+    .long   StubRetZero | -738  gethostbyname_r
+    .long   StubRetZero | -744  gethostbyaddr_r
+    .long   StubRetZero | -750
+    .long   StubRetZero | -756
+    .long   StubRetZero | -762
+    .long   StubRetZero | -768
+    .long   StubRetZero | -774
+    .long   StubRetZero | -780
+    .long   StubRetZero | -786
+    .long   StubRetZero | -792
+    .long   StubRetZero | -798
+    .long   StubRetZero | -804  freeaddrinfo
+    .long   StubRetZero | -810  getaddrinfo
+    .long   StubRetZero | -816  gai_strerror
+    .long   StubRetZero | -822  getnameinfo
     .long   -1
 
     | C symbols
@@ -272,4 +375,84 @@ Expunge:
 | ---- Null -------------------------------------------------------------------
 Null:
     moveq   #0,d0
+    rts
+
+| ---- StubRetZero -----------------------------------------------------------
+| Used for all LVOs -306..-822 that we don't implement.  Returns 0/NULL in d0
+| so callers see "function failed / returned nothing" and fall back to their
+| legacy / non-Roadshow code path.  Preserves d2-d7/a2-a7 implicitly (no save
+| needed since we touch nothing).
+StubRetZero:
+    moveq   #0,d0
+    rts
+
+| ---- GCC soft-division helpers ---------------------------------------------
+|
+| GCC -m68000 emits calls to __udivsi3 / __umodsi3 for 32÷32 unsigned
+| division because the 68000 DIVU is only 32÷16.  The Amiga cross-compiler's
+| libgcc deliberately omits these (it targets hand-written asm), so we
+| supply them here.
+|
+| Calling convention — m68k-amigaos C ABI (stack, NOT register):
+|   Arguments pushed right-to-left; caller pops after return.
+|   [sp+4] = dividend (first arg), [sp+8] = divisor (second arg)
+|   Returns: D0 = result.  Must preserve D2-D7 / A2-A7.
+|
+| Note: the GCC register-based helper ABI (D0/D1) is NOT used by
+| m68k-amigaos-gcc 6.5.0b; it generates normal C stack calls.
+|
+| Algorithm: classic shift-subtract binary long division (32 iterations).
+|   remainder = 0
+|   for bit = 31 downto 0:
+|     remainder = (remainder << 1) | bit[i](dividend)
+|     if remainder >= divisor: remainder -= divisor; quotient |= (1<<i)
+|
+| Uses numeric local labels so they don't clash with anything else.
+
+    .globl  ___udivsi3
+___udivsi3:
+    | [sp+4]=dividend, [sp+8]=divisor at entry
+    movem.l d2/d3/d4,-(sp)     | save 12 bytes; args now at [sp+16],[sp+20]
+    move.l  16(sp),d0           | d0 = dividend
+    move.l  20(sp),d3           | d3 = divisor
+    moveq   #0,d2               | d2 = remainder
+    moveq   #0,d4               | d4 = quotient
+    moveq   #31,d1              | d1 = bit counter 31..0 (dbra uses word part)
+10:
+    lsl.l   #1,d2               | remainder <<= 1
+    btst    d1,d0               | test bit[d1] of dividend (d0 unchanged)
+    beq     11f
+    bset    #0,d2               | remainder |= 1
+11:
+    cmp.l   d3,d2               | remainder >= divisor?
+    blo     12f
+    sub.l   d3,d2               | remainder -= divisor
+    bset    d1,d4               | quotient |= (1 << bit)
+12:
+    dbra    d1,10b
+    move.l  d4,d0               | return quotient in d0
+    movem.l (sp)+,d2/d3/d4
+    rts
+
+    .globl  ___umodsi3
+___umodsi3:
+    | [sp+4]=dividend, [sp+8]=divisor at entry
+    movem.l d2/d3,-(sp)         | save 8 bytes; args now at [sp+12],[sp+16]
+    move.l  12(sp),d0           | d0 = dividend
+    move.l  16(sp),d3           | d3 = divisor
+    moveq   #0,d2               | d2 = remainder
+    moveq   #31,d1              | d1 = bit counter 31..0
+13:
+    lsl.l   #1,d2               | remainder <<= 1
+    btst    d1,d0               | test bit[d1] of dividend (d0 unchanged)
+    beq     14f
+    bset    #0,d2               | remainder |= 1
+14:
+    cmp.l   d3,d2               | remainder >= divisor?
+    blo     15f
+    sub.l   d3,d2               | remainder -= divisor
+15:
+    dbra    d1,13b
+    move.l  d2,d0               | return remainder in d0
+    movem.l (sp)+,d2/d3
     rts

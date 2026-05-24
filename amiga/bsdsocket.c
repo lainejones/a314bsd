@@ -1,15 +1,27 @@
 /*
- * bsdsocket.c - a314BSD bsdsocket.library
+ * bsdsocket.c — a314bsd bsdsocket.library v5.0
  *
- * Each OpenLibrary() call connects a new A314 stream to the "bsdsocket"
- * service running on the Pi.  All socket operations are synchronous
- * request/response over that stream.
+ * v5 architecture (vs v4):
+ *   - One dispatcher task per OpenLibrary.  The dispatcher owns the A314
+ *     connection and does ALL A314_WRITE / A314_READ I/O.
+ *   - Library functions called by the application (in the application's task
+ *     context) just build a request, hand it to the dispatcher via a message
+ *     port, and Wait() ONCE for the reply.  No matter how many physical A314
+ *     packets are needed to move the data, the caller's task does exactly
+ *     one Wait per library call.
+ *   - The wire protocol is the v5 framing in include/bsd_proto.h: one REQ
+ *     header packet (with inline args), optional input-data chunks, one RES
+ *     header packet, optional output-data chunks.  Pi side does one Linux
+ *     syscall per Amiga library call.
  *
- * Wire protocol (all multi-byte fields big-endian, native on m68k):
- *   Request:  opcode(1) seq(1) arglen(2) args[arglen]
- *   Response: seq(1) result(4) datalen(2) data[datalen]
- *   result >= 0: success / return value
- *   result <  0: -errno (BSD/AmiTCP errno values)
+ * Why this matters for wget reliability: v4 did N Pi round-trips per
+ * bsd_recv (one per 245-byte chunk), giving 2N Wait() points where another
+ * Amiga task could leave the shared FPU exception flags set.  When wget
+ * resumed, its mathieeedoubbas calls inherited the poisoned FPU state,
+ * causing NaN/Inf in its bandwidth and percentage math — and tripping
+ * "percentage <= 100" or "msecs >= 0" asserts ~33% of the time.  Moving the
+ * Wait()s into the dispatcher task means wget's calling task does one Wait
+ * per recv, matching the behaviour of working stacks (Roadshow, Niklas).
  */
 
 #include <exec/types.h>
@@ -19,8 +31,12 @@
 #include <exec/memory.h>
 #include <exec/io.h>
 #include <exec/ports.h>
-#include <devices/timer.h>
 #include <exec/tasks.h>
+#include <exec/semaphores.h>
+#include <devices/timer.h>
+#include <dos/dos.h>
+#include <dos/dosextens.h>
+#include <dos/dostags.h>
 
 #include <proto/exec.h>
 #include <proto/dos.h>
@@ -40,156 +56,126 @@ struct BsdBase {
     struct ExecBase *SysBase;
     APTR             SegList;
     struct MinList   sessions;
-    ULONG            next_socket_id; /* monotonic counter; a314_Socket = ++this */
+    ULONG            next_socket_id;   /* monotonic A314 socket ID */
 };
 
-/* ---- Per-opener session -------------------------------------------------- */
+/* ---- Request packet (caller -> dispatcher) ------------------------------- */
 
-/*
- * A314 ring-buffer limit: each PKT_DATA payload must fit in the 256-byte ring
- * buffer less a 3-byte header, and the Amiga device rejects writes with
- * len + 3 > 255 — so the hard ceiling is 252 bytes per A314_READ or A314_WRITE.
- *
- * We derive two constants:
- *   A314_MAX_PAYLOAD  252  — absolute hardware limit per message
- *   BSD_MAX_DATA_RECV 245  — max data per recv response  (252 − 7 RSP hdr)
- *   BSD_MAX_DATA_SEND 242  — max data per send request   (252 − 4 REQ hdr − 6 args)
- *
- * SESSION_IO_SIZE only needs to cover one message at a time.
- */
-#define A314_MAX_PAYLOAD    252
-#define BSD_MAX_DATA_RECV   245   /* A314_MAX_PAYLOAD - BSD_RSP_HDR_SIZE(7) */
-#define BSD_MAX_DATA_SEND   242   /* A314_MAX_PAYLOAD - BSD_REQ_HDR_SIZE(4) - send_args(6) */
-#define SESSION_IO_SIZE     256   /* one ring-buffer worth */
+#define DISP_STACK_SIZE  4096
+#define DISP_TASK_PRI    0
+#define DISP_TASK_NAME   "a314bsd.disp"
+
+/* A BsdRequest is exec.message passed from a caller task to the dispatcher.
+ * The caller fills the fields, PutMsg's it to the dispatcher's port, then
+ * Wait()s on its own reply port for the dispatcher to fill in result/errno
+ * and ReplyMsg.  Only ONE request is in flight per session at a time. */
+struct BsdRequest {
+    struct Message     msg;       /* embedded — for PutMsg/ReplyMsg */
+    UBYTE              opcode;    /* BSDOP_* */
+    UBYTE              args[BSD_MAX_REQ_ARGS];
+    UWORD              arglen;    /* bytes filled in args[] */
+    /* Input data: bytes to send to Pi after the REQ header (e.g. send buffer) */
+    CONST_APTR         indata;
+    ULONG              inlen;
+    /* Output buffer: where dispatcher writes data Pi sends back (recv buffer) */
+    APTR               outdata;
+    ULONG              outmax;
+    /* Filled by dispatcher: */
+    LONG               result;    /* >= 0 success / < 0 = -errno style */
+    LONG               errno_val; /* Pi's errno (BSD/AmiTCP numbering) */
+    ULONG              outlen;    /* bytes written to outdata[] */
+};
+
+/* ---- Global DOSBase (kept open forever once first opened) --------------- */
+/* CreateNewProcTags creates a dos.library-managed Process — dos.library
+ * must stay open for that process's lifetime AND when it exits.  Closing
+ * dos.library right after CreateNewProcTags can crash the new process.
+ * Same applies to Delay() in bsd_close_lib. */
+static struct Library         *s_DOSBase             = NULL;
+static struct SignalSemaphore  s_DOSBase_sema;
+static BOOL                    s_DOSBase_sema_inited = FALSE;
+
+static struct Library *get_dosbase(struct ExecBase *SysBase)
+{
+    if (s_DOSBase) return s_DOSBase;
+    if (!s_DOSBase_sema_inited) {
+        InitSemaphore(&s_DOSBase_sema);
+        s_DOSBase_sema_inited = TRUE;
+    }
+    ObtainSemaphore(&s_DOSBase_sema);
+    if (!s_DOSBase) s_DOSBase = OpenLibrary((STRPTR)"dos.library", 0);
+    ReleaseSemaphore(&s_DOSBase_sema);
+    return s_DOSBase;
+}
+
+/* ---- Per-OpenLibrary session -------------------------------------------- */
 
 struct BsdSession {
     struct MinNode         node;
-    struct Task           *task;
+    struct Task           *caller_task;   /* the task that opened us */
 
-    struct MsgPort        *port;
-    struct A314_IORequest *ior;
+    /* Dispatcher: per-session task that owns the A314 connection. */
+    struct Task           *disp_task;
+    struct MsgPort        *disp_port;     /* dispatcher's incoming request port */
+    BYTE                   disp_kill_sig; /* allocated in dispatcher; we Signal it to ask exit */
 
+    /* Reply port (lives in caller's task) for receiving dispatcher's replies */
+    struct MsgPort         reply_port;
+    BYTE                   reply_sig_bit;
+
+    /* The one in-flight request (reused; we serialise per-session) */
+    struct BsdRequest      req;
+
+    /* Errno bookkeeping for SetErrnoPtr / SocketBaseTagList(SBTC_ERRNO*) */
     LONG                   errno_val;
-    LONG                  *errno_ptr;  /* caller's errno cell; set by SetErrnoPtr/SocketBaseTagList */
-    UBYTE                  seq;
+    LONG                  *errno_ptr;
+    LONG                  *h_errno_ptr;
 
-    /* protoent result buffer — filled by getprotobyname/getprotobynumber */
-    struct protoent        pent;
-    BYTE                   pent_name[16];
-    APTR                   pent_aliases[1]; /* { NULL } */
-
-    /* hostent result buffers — reused across gethostbyname calls */
+    /* For hostent / inet_ntoa result buffers returned by reference */
+    BYTE                   ntoa_buf[20];
     struct hostent         hent;
     BYTE                   hname[256];
-    ULONG                  haddr;          /* first address, net-byte-order */
-    APTR                   haddr_list[2];  /* { &haddr, NULL } */
-    APTR                   haliases[1];    /* { NULL } */
+    ULONG                  haddr;
+    APTR                   haddr_list[2];
+    APTR                   haliases[1];
 
-    /* inet_ntoa result buffer */
-    BYTE                   ntoa_buf[20];
-
-    /* Non-blocking socket bitmask.
-     * Bit N is set when fd N has been put into non-blocking mode via
-     * ioctlsocket(FIONBIO, 1).  Used by bsd_recv() to decide whether a
-     * short read from the Pi means "TCP buffer drained, return now" (non-
-     * blocking) or "loop and get more data" (blocking).  Without this
-     * distinction, speed-test programs that call recv(fd, buf, large, 0)
-     * on a blocking socket only receive one 245-byte A314 chunk and
-     * compute a near-zero download speed. */
-    ULONG                  nonblock_fds;
-
-    /* servent result buffers — reused across getservby* calls */
-    struct servent         sent;
-    BYTE                   sent_name[64];   /* service name  */
-    BYTE                   sent_proto[16];  /* protocol name */
-    APTR                   sent_aliases[1]; /* { NULL }      */
-
-    /* Unified request/response I/O buffer */
-    UBYTE                  io_buf[SESSION_IO_SIZE];
+    /* protoent buffer for getprotobyname/getprotobynumber (local, no Pi).
+     * Returned by reference; same buffer reused across calls. */
+    struct protoent        pent;
+    BYTE                   pent_name[16];
+    APTR                   pent_aliases[1];   /* always {NULL} */
 };
 
-/* ---- Exec shorthand ------------------------------------------------------ */
-/* SysBase must be declared as a local 'struct ExecBase *SysBase' in each
- * function so that the proto/exec.h inline macros pick it up. */
+/* Parameters passed from bsd_open to the dispatcher task at AddTask time.
+ * Allocated by bsd_open, freed by bsd_open after dispatcher signals ready.
+ *
+ * The dispatcher CREATES its own MsgPort using its own signal allocation
+ * (signal bits are per-task in AmigaOS), then writes the port pointer back
+ * here so the caller can use it for PutMsg. */
+struct DispStartup {
+    struct ExecBase       *SysBase;
+    struct BsdSession     *sess;
+    ULONG                  socket_id;     /* A314 channel ID to use for CONNECT */
+    struct Task           *parent;        /* signal back when ready or failed */
+    BYTE                   parent_sig;    /* signal bit (allocated in parent) */
+    /* Filled by dispatcher before signalling parent: */
+    struct MsgPort        *disp_port_out; /* dispatcher's request port */
+    BYTE                   kill_sig_out;  /* signal bit dispatcher allocated for shutdown */
+    BOOL                   ready_ok;      /* TRUE on success */
+};
+
+/* ---- Forward decls ------------------------------------------------------- */
+
+static struct BsdSession *find_session(struct BsdBase *base);
+static void dispatcher_entry(void);
+static BOOL do_rpc(struct BsdSession *sess);
+static void w16(UBYTE *p, UWORD v);
+static void w32(UBYTE *p, ULONG v);
 
 /* ---- Low-level helpers --------------------------------------------------- */
 
-static void w16(UBYTE *p, UWORD v)
-{
-    p[0] = (UBYTE)(v >> 8);
-    p[1] = (UBYTE)(v & 0xFF);
-}
-
-static void w32(UBYTE *p, ULONG v)
-{
-    p[0] = (UBYTE)(v >> 24);
-    p[1] = (UBYTE)(v >> 16);
-    p[2] = (UBYTE)(v >>  8);
-    p[3] = (UBYTE)(v & 0xFF);
-}
-
-/* Fill the 4-byte request header at io_buf[0..3].
- * noinline: prevents -O2 from reordering or eliminating the opcode write. */
-static __attribute__((noinline)) void fill_hdr(struct BsdSession *sess,
-                                               UBYTE opcode, UWORD arglen)
-{
-    sess->io_buf[0] = opcode;
-    sess->io_buf[1] = sess->seq++;
-    sess->io_buf[2] = (UBYTE)(arglen >> 8);
-    sess->io_buf[3] = (UBYTE)(arglen & 0xFF);
-}
-
-/* ---- RPC: write request from io_buf, read response into io_buf ----------- */
-/*
- * Caller must have filled io_buf[0 .. req_total-1] with the complete
- * request frame (header + args).  On return io_buf holds the response.
- * Returns result field (>=0 success, <0 -errno); sets sess->errno_val.
- */
-static LONG do_rpc(struct BsdSession *sess, struct ExecBase *SysBase,
-                   UWORD req_total)
-{
-    struct BsdRspHdr *rsp;
-    LONG r;
-
-    /* Write request */
-    sess->ior->a314_Request.io_Command = A314_WRITE;
-    sess->ior->a314_Buffer             = (STRPTR)sess->io_buf;
-    sess->ior->a314_Length             = (WORD)req_total;
-    if (DoIO((struct IORequest *)sess->ior) != A314_WRITE_OK) {
-        sess->errno_val = 5; /* EIO: A314 WRITE failed (EOS-sent or RESET) */
-        return -5;
-    }
-
-    /* Read response (overwrites io_buf — request is already sent) */
-    sess->ior->a314_Request.io_Command = A314_READ;
-    sess->ior->a314_Buffer             = (STRPTR)sess->io_buf;
-    sess->ior->a314_Length             = (WORD)SESSION_IO_SIZE;
-    r = DoIO((struct IORequest *)sess->ior);
-    if (r != A314_READ_OK || sess->ior->a314_Length < BSD_RSP_HDR_SIZE) {
-        sess->errno_val = 6; /* ENXIO: A314 READ failed (EOS or RESET from Pi) */
-        return -6;
-    }
-
-    rsp = (struct BsdRspHdr *)sess->io_buf;
-    r   = rsp->result;   /* packed LONG, big-endian = native on m68k */
-    sess->errno_val = (r < 0) ? -r : 0;
-    if (sess->errno_ptr) *sess->errno_ptr = sess->errno_val;
-    return r;
-}
-
-/* Normalize do_rpc() to standard BSD return conventions.
- * errno is already set by do_rpc(); just clamp negative to -1.
- *   RPC_RET  — for calls that return fd / byte-count on success
- *   RPC_ZERO — for calls that return 0 on success
- *
- * IMPORTANT: implemented as static inline functions, NOT macros.
- * A macro form like ((r)<0?-1:(r)) would evaluate the argument TWICE
- * when r >= 0, causing do_rpc() to be called a second time with stale
- * io_buf contents — that's the "opcode=0 mystery packet" bug. */
-static __inline LONG rpc_ret(LONG r)  { return r < 0 ? -1L : r;  }
-static __inline LONG rpc_zero(LONG r) { return r < 0 ? -1L : 0L; }
-#define RPC_RET(r)  rpc_ret(r)
-#define RPC_ZERO(r) rpc_zero(r)
+static void w16(UBYTE *p, UWORD v) { p[0] = v >> 8; p[1] = v; }
+static void w32(UBYTE *p, ULONG v) { p[0] = v>>24; p[1] = v>>16; p[2] = v>>8; p[3] = v; }
 
 /* ---- Session lookup ------------------------------------------------------ */
 
@@ -203,213 +189,383 @@ static struct BsdSession *find_session(struct BsdBase *base)
          s->node.mln_Succ != NULL;
          s = (struct BsdSession *)s->node.mln_Succ)
     {
-        if (s->task == me)
-            return s;
+        if (s->caller_task == me) return s;
     }
     return NULL;
 }
 
-/* ---- Orphan cleanup ------------------------------------------------------ */
+/* ---- do_rpc: caller-side RPC to dispatcher ------------------------------ */
 /*
- * When an application crashes without calling CloseLibrary, our Close
- * function is never called, leaving a "zombie" BsdSession in the list
- * with its a314 device still open.  The pending A314_READ DoIO for that
- * stream keeps the ring buffer blocked, so the next A314_CONNECT from any
- * task fails immediately (nothing reaches the Pi).
- *
- * Called at the top of bsd_open: scan the sessions list, check exec's
- * task ready/wait queues, and close any session whose owning task no
- * longer exists.
- *
- * The tricky part: DoIO is safe only when the IORequest's reply port
- * belongs to the calling task (otherwise Signal() would target the dead
- * task's stack).  We solve this by temporarily replacing the reply port
- * with a freshly-created port owned by the current task before issuing
- * A314_EOS + CloseDevice.  The original orphaned port's signal bit was
- * allocated in the dead task; that task's memory is gone, so we skip
- * FreeSignal and free the port memory directly with FreeMem.
+ * Build the request fields in sess->req before calling.  This function does
+ * the PutMsg/WaitPort/GetMsg dance.  Caller's task Wait()s exactly once.
+ * Returns TRUE on protocol success (result/errno filled), FALSE on disaster
+ * (dispatcher gone, signal failure, etc.).
  */
-static void cleanup_orphaned_sessions(struct BsdBase *base,
-                                      struct ExecBase *SysBase)
+static BOOL do_rpc(struct BsdSession *sess)
 {
-    struct Task       *me = FindTask(NULL);
-    struct BsdSession *s, *next;
-    struct Node       *n;
-    BOOL               alive;
+    /* SysBase is needed for PutMsg/WaitPort.  In the caller's task context
+     * we get it from address 4 to avoid threading dependencies. */
+    struct ExecBase *SysBase = *(struct ExecBase **)4UL;
 
-    s = (struct BsdSession *)base->sessions.mlh_Head;
-    while (s->node.mln_Succ != NULL)
-    {
-        next = (struct BsdSession *)s->node.mln_Succ;
-
-        if (s->task == me) { s = next; continue; } /* current task: skip */
-
-        /* Check exec task lists — must Forbid while scanning. */
-        Forbid();
-        alive = FALSE;
-        for (n = SysBase->TaskReady.lh_Head; !alive && n->ln_Succ; n = n->ln_Succ)
-            if ((struct Task *)n == s->task) alive = TRUE;
-        for (n = SysBase->TaskWait.lh_Head; !alive && n->ln_Succ; n = n->ln_Succ)
-            if ((struct Task *)n == s->task) alive = TRUE;
-        Permit();
-
-        if (!alive)
-        {
-            struct MsgPort *tmp;
-
-            Remove((struct Node *)&s->node);
-
-            /* Replace orphaned reply port so DoIO signals the current task.
-             * If the dead task crashed mid-recv, s->ior is still queued in
-             * the a314 device doing A314_READ.  Reusing an in-flight IORequest
-             * for A314_EOS would corrupt the device's internal list.
-             * CheckIO returns NULL while the IO is still pending — abort it
-             * first so the IORequest is free before we send EOS. */
-            tmp = CreateMsgPort();
-            if (tmp)
-            {
-                s->ior->a314_Request.io_Message.mn_ReplyPort = tmp;
-                if (!CheckIO((struct IORequest *)s->ior))
-                {
-                    AbortIO((struct IORequest *)s->ior);
-                    WaitIO((struct IORequest *)s->ior);
-                }
-                s->ior->a314_Request.io_Command = A314_EOS;
-                DoIO((struct IORequest *)s->ior);  /* tell Pi stream is done */
-                DeleteMsgPort(tmp);
-            }
-            CloseDevice((struct IORequest *)s->ior);
-            DeleteIORequest((struct IORequest *)s->ior);
-
-            /* The original port's AllocSignal was charged to the dead task.
-             * Calling DeleteMsgPort would FreeSignal into freed memory.
-             * Skip straight to FreeMem — the signal bit is already gone. */
-            FreeMem(s->port, sizeof(struct MsgPort));
-
-            FreeVec(s);
-            base->lib.lib_OpenCnt--;
-        }
-
-        s = next;
+    if (!sess->disp_task) {
+        sess->req.result    = -1;
+        sess->req.errno_val = 5;  /* EIO */
+        return FALSE;
     }
+
+    sess->req.msg.mn_ReplyPort = &sess->reply_port;
+    sess->req.msg.mn_Length    = sizeof(struct BsdRequest);
+    PutMsg(sess->disp_port, &sess->req.msg);
+    WaitPort(&sess->reply_port);
+    (void)GetMsg(&sess->reply_port);
+    return TRUE;
 }
 
-/* ---- Open/Close ---------------------------------------------------------- */
+/* ---- Dispatcher task ---------------------------------------------------- */
+/*
+ * Entry point for the per-session dispatcher task.  Pulls its startup
+ * parameters from a global passing slot (set up by bsd_open), opens
+ * a314.device, registers as a CONNECT to the "bsdsocket" service, then
+ * loops processing requests from the session's MsgPort.
+ *
+ * The dispatcher does ALL the A314_WRITE / A314_READ work.  Each request:
+ *   1. Write REQ header packet.
+ *   2. Write inlen bytes of input data (in MAX_CHUNK-sized A314_WRITEs).
+ *   3. Read RES header packet (one A314_READ).
+ *   4. Read outlen bytes of output data into caller's buffer (multiple
+ *      A314_READs, each at most MAX_CHUNK = 252 bytes).
+ *   5. ReplyMsg back to caller.
+ *
+ * From the caller's perspective, that whole sequence is one Wait().
+ */
+
+/* The dispatcher passes startup state via a global slot — set by bsd_open
+ * before AddTask, read by dispatcher immediately after start.  This avoids
+ * needing to allocate-and-free a separate startup struct that the dispatcher
+ * has to figure out to free. */
+static struct DispStartup *s_disp_startup = NULL;
+static struct SignalSemaphore s_disp_startup_sema;
+static BOOL                   s_disp_startup_sema_inited = FALSE;
+
+static void dispatcher_entry(void)
+{
+    struct ExecBase       *SysBase = *(struct ExecBase **)4UL;
+    struct DispStartup    *start;
+    struct BsdSession     *sess;
+    ULONG                  socket_id;
+    struct MsgPort        *a314_port  = NULL;  /* reply port for A314 IO */
+    struct MsgPort        *req_port   = NULL;  /* incoming request port */
+    struct A314_IORequest *ior        = NULL;
+    UBYTE                  io_buf[BSD_MAX_CHUNK];
+    BOOL                   running    = TRUE;
+    BYTE                   kill_sig   = -1;
+
+    /* Pick up our startup info from the global slot.  Parent holds the
+     * semaphore around this so only one dispatcher can start at a time. */
+    start = s_disp_startup;
+    s_disp_startup = NULL;
+    sess = start->sess;
+    socket_id = start->socket_id;
+
+    /* Allocate the kill signal — must be from THIS task's signal pool. */
+    kill_sig = AllocSignal(-1);
+    if (kill_sig == -1) goto fail_start;
+
+    /* Create our request port — signal bit allocated from THIS task.  Caller
+     * will PutMsg to this port; Signal will wake us correctly. */
+    req_port = CreateMsgPort();
+    if (!req_port) goto fail_start;
+
+    /* Create A314 IO request + reply port. */
+    a314_port = CreateMsgPort();
+    if (!a314_port) goto fail_start;
+    ior = (struct A314_IORequest *)CreateIORequest(a314_port, sizeof(struct A314_IORequest));
+    if (!ior) goto fail_start;
+    if (OpenDevice((STRPTR)A314_NAME, 0, (struct IORequest *)ior, 0) != 0)
+        goto fail_start;
+
+    /* Connect to the "bsdsocket" Pi service. */
+    ior->a314_Socket  = socket_id;
+    ior->a314_Buffer  = (STRPTR)"bsdsocket";
+    ior->a314_Length  = 9;
+    ior->a314_Request.io_Command = A314_CONNECT;
+    if (DoIO((struct IORequest *)ior) != A314_CONNECT_OK)
+        goto fail_after_open;
+
+    /* Notify parent we're ready — hand over port + kill signal numbers. */
+    start->disp_port_out = req_port;
+    start->kill_sig_out  = kill_sig;
+    start->ready_ok      = TRUE;
+    Signal(start->parent, 1L << start->parent_sig);
+    start = NULL;   /* parent will free it */
+
+    /* Main loop: wait on either the request port or the kill signal. */
+    while (running) {
+        ULONG sigs = Wait((1L << req_port->mp_SigBit) | (1L << kill_sig));
+        if (sigs & (1L << kill_sig)) {
+            running = FALSE;
+            break;
+        }
+        struct BsdRequest *req;
+        while ((req = (struct BsdRequest *)GetMsg(req_port)) != NULL) {
+            UBYTE  hdr[BSD_REQ_HDR_SIZE];
+            UBYTE  res_hdr[BSD_RES_HDR_SIZE];
+            CONST_APTR src;
+            ULONG  remaining;
+            UWORD  chunk;
+
+            /* --- Send REQ header packet --- */
+            hdr[0] = req->opcode;
+            hdr[1] = 0;                       /* seq (unused for now) */
+            w16(&hdr[2], req->arglen);
+            w16(&hdr[4], (UWORD)req->inlen);
+            /* The REQ header + args go in ONE A314_WRITE so Pi sees them as
+             * a single PKT_DATA.  We assume arglen <= BSD_MAX_REQ_ARGS so
+             * total <= 252. */
+            {
+                UBYTE pkt[BSD_REQ_HDR_SIZE + BSD_MAX_REQ_ARGS];
+                UWORD i;
+                for (i = 0; i < BSD_REQ_HDR_SIZE; i++) pkt[i] = hdr[i];
+                for (i = 0; i < req->arglen; i++)
+                    pkt[BSD_REQ_HDR_SIZE + i] = req->args[i];
+                ior->a314_Request.io_Command = A314_WRITE;
+                ior->a314_Buffer = (STRPTR)pkt;
+                ior->a314_Length = (WORD)(BSD_REQ_HDR_SIZE + req->arglen);
+                if (DoIO((struct IORequest *)ior) != A314_WRITE_OK) {
+                    req->result = -1; req->errno_val = 5;
+                    goto reply;
+                }
+            }
+
+            /* --- Send input data chunks (if any) --- */
+            src       = req->indata;
+            remaining = req->inlen;
+            while (remaining > 0) {
+                chunk = (remaining > BSD_MAX_CHUNK) ? BSD_MAX_CHUNK : (UWORD)remaining;
+                ior->a314_Request.io_Command = A314_WRITE;
+                ior->a314_Buffer = (STRPTR)src;
+                ior->a314_Length = (WORD)chunk;
+                if (DoIO((struct IORequest *)ior) != A314_WRITE_OK) {
+                    req->result = -1; req->errno_val = 5;
+                    goto reply;
+                }
+                src = (CONST_APTR)((UBYTE *)src + chunk);
+                remaining -= chunk;
+            }
+
+            /* --- Receive RES header packet --- */
+            ior->a314_Request.io_Command = A314_READ;
+            ior->a314_Buffer = (STRPTR)io_buf;
+            ior->a314_Length = BSD_MAX_CHUNK;
+            if (DoIO((struct IORequest *)ior) != A314_READ_OK
+                || ior->a314_Length < BSD_RES_HDR_SIZE) {
+                req->result = -1; req->errno_val = 6;  /* ENXIO */
+                goto reply;
+            }
+            {
+                UWORD i;
+                for (i = 0; i < BSD_RES_HDR_SIZE; i++) res_hdr[i] = io_buf[i];
+            }
+            /* Decode: seq(1) result(4) errno(4) outlen(2) */
+            req->result = ((LONG)res_hdr[1] << 24) | ((LONG)res_hdr[2] << 16)
+                        | ((LONG)res_hdr[3] <<  8) |  (LONG)res_hdr[4];
+            req->errno_val = ((LONG)res_hdr[5] << 24) | ((LONG)res_hdr[6] << 16)
+                           | ((LONG)res_hdr[7] <<  8) |  (LONG)res_hdr[8];
+            req->outlen = ((ULONG)res_hdr[9] << 8) | (ULONG)res_hdr[10];
+
+            /* --- Receive output data chunks (if any) --- */
+            {
+                UBYTE *dst       = (UBYTE *)req->outdata;
+                ULONG  to_copy   = (req->outlen < req->outmax) ? req->outlen : req->outmax;
+                ULONG  to_discard = req->outlen - to_copy;
+                ULONG  copied = 0;
+                /* Any leftover bytes from the RES read are not present —
+                 * RES header packet is its own A314 packet. */
+                while (copied < to_copy) {
+                    ULONG want = to_copy - copied;
+                    if (want > BSD_MAX_CHUNK) want = BSD_MAX_CHUNK;
+                    ior->a314_Request.io_Command = A314_READ;
+                    ior->a314_Buffer = (STRPTR)(dst + copied);
+                    ior->a314_Length = (WORD)want;
+                    if (DoIO((struct IORequest *)ior) != A314_READ_OK) {
+                        req->result = -1; req->errno_val = 6;
+                        goto reply;
+                    }
+                    copied += ior->a314_Length;
+                }
+                /* Discard any extra bytes Pi sent (in case maxlen was less
+                 * than what Pi returned).  Shouldn't happen if Pi respects
+                 * the maxlen arg, but defensive. */
+                while (to_discard > 0) {
+                    ULONG want = (to_discard > BSD_MAX_CHUNK) ? BSD_MAX_CHUNK : to_discard;
+                    ior->a314_Request.io_Command = A314_READ;
+                    ior->a314_Buffer = (STRPTR)io_buf;
+                    ior->a314_Length = (WORD)want;
+                    if (DoIO((struct IORequest *)ior) != A314_READ_OK) break;
+                    to_discard -= ior->a314_Length;
+                }
+            }
+
+reply:
+            /* Update session-level errno cache; the library function that
+             * called us will optionally propagate to *errno_ptr. */
+            sess->errno_val = (req->result < 0) ? req->errno_val : 0;
+            ReplyMsg(&req->msg);
+        }
+    }
+
+    /* --- Cleanup --- */
+    ior->a314_Request.io_Command = A314_EOS;
+    DoIO((struct IORequest *)ior);
+    CloseDevice((struct IORequest *)ior);
+    DeleteIORequest((struct IORequest *)ior);
+    DeleteMsgPort(a314_port);
+    DeleteMsgPort(req_port);
+    FreeSignal(kill_sig);
+    sess->disp_task = NULL;
+    /* Created via CreateNewProc → dos.library handles cleanup when we return. */
+    return;
+
+fail_after_open:
+    if (ior) DeleteIORequest((struct IORequest *)ior);
+fail_start:
+    if (a314_port) DeleteMsgPort(a314_port);
+    if (req_port)  DeleteMsgPort(req_port);
+    if (kill_sig != -1) FreeSignal(kill_sig);
+    if (start) {
+        start->ready_ok = FALSE;
+        Signal(start->parent, 1L << start->parent_sig);
+    }
+    sess->disp_task = NULL;
+    return;
+}
+
+/* ---- Open / Close ------------------------------------------------------- */
 
 struct BsdBase *bsd_open(struct BsdBase *base)
 {
-    struct ExecBase       *SysBase = base->SysBase;
-    struct BsdSession     *sess;
-    struct MsgPort        *port;
-    struct A314_IORequest *ior;
-    ULONG                  attempt;
+    struct ExecBase    *SysBase = base->SysBase;
+    struct BsdSession  *sess;
+    struct DispStartup *startup;
+    BYTE                ready_sig;
+    ULONG               sigs;
 
-    /*
-     * Allocate the new session BEFORE cleaning up orphaned sessions.
-     *
-     * The a314 device identifies channels by a14_Socket = (ULONG)sess.
-     * cleanup_orphaned_sessions() calls FreeVec(old_sess), which returns
-     * that memory to exec's free list.  A subsequent AllocVec(new_sess)
-     * would then get the same address back — making the new channel's
-     * socket ID identical to the one just torn down.  The a314 device
-     * rejects A314_CONNECT for a socket ID whose channel was just closed,
-     * so every retry fails regardless of how long we wait.
-     *
-     * Allocating first ensures new_sess != old_sess so the device sees a
-     * genuinely fresh channel identifier.
-     */
-    sess = (struct BsdSession *)AllocVec(sizeof(struct BsdSession),
-                                         MEMF_PUBLIC | MEMF_CLEAR);
+    sess = (struct BsdSession *)AllocVec(sizeof(*sess), MEMF_PUBLIC | MEMF_CLEAR);
     if (!sess) return NULL;
 
-    /* Clean up sessions left behind by tasks that crashed without calling
-     * CloseLibrary — their open a314 channel blocks the ring buffer. */
-    cleanup_orphaned_sessions(base, SysBase);
+    sess->caller_task   = FindTask(NULL);
+    sess->disp_kill_sig = -1;
 
-    /*
-     * Retry loop for OpenDevice + A314_CONNECT.
-     *
-     * After CloseDevice the a314 device task may need scheduler time to
-     * finish its internal teardown before it can handle a new OpenDevice.
-     * Fast retries alone are not enough — we need an actual sleep so the
-     * device task gets CPU time.  Open dos.library just long enough to
-     * call Delay() between attempts.  The first attempt has no delay so
-     * normal (non-crash) opens are fast.
-     */
-    port = NULL;
-    ior  = NULL;
-    for (attempt = 0; attempt < 5; attempt++)
+    /* Reply port for receiving dispatcher's ReplyMsg.  Built manually so
+     * we can hard-code the signal bit allocated from the caller's task. */
+    sess->reply_sig_bit = AllocSignal(-1);
+    if (sess->reply_sig_bit == -1) goto fail;
+    sess->reply_port.mp_Node.ln_Type = NT_MSGPORT;
+    sess->reply_port.mp_Flags        = PA_SIGNAL;
+    sess->reply_port.mp_SigBit       = sess->reply_sig_bit;
+    sess->reply_port.mp_SigTask      = sess->caller_task;
+    /* Manual NewList equivalent — avoids needing the NewList symbol. */
+    sess->reply_port.mp_MsgList.lh_Head     = (struct Node *)&sess->reply_port.mp_MsgList.lh_Tail;
+    sess->reply_port.mp_MsgList.lh_Tail     = NULL;
+    sess->reply_port.mp_MsgList.lh_TailPred = (struct Node *)&sess->reply_port.mp_MsgList.lh_Head;
+
+    /* Dispatcher's request port is created INSIDE the dispatcher task so
+     * the port's signal bit is allocated from the dispatcher's signal pool
+     * (signals are per-task on AmigaOS).  We fill sess->disp_port from the
+     * startup struct after the dispatcher signals ready. */
+
+    /* Allocate signal we'll wait on for "dispatcher is ready". */
+    ready_sig = AllocSignal(-1);
+    if (ready_sig == -1) goto fail_reply;
+
+    /* Build the startup descriptor.  Use the global slot + semaphore to
+     * hand it to the new task (AddTask doesn't carry a user arg). */
+    if (!s_disp_startup_sema_inited) {
+        InitSemaphore(&s_disp_startup_sema);
+        s_disp_startup_sema_inited = TRUE;
+    }
+    ObtainSemaphore(&s_disp_startup_sema);
+
+    startup = AllocMem(sizeof(*startup), MEMF_PUBLIC | MEMF_CLEAR);
+    if (!startup) { ReleaseSemaphore(&s_disp_startup_sema); goto fail_sig; }
+
+    startup->SysBase     = SysBase;
+    startup->sess        = sess;
+    startup->socket_id   = ++base->next_socket_id;
+    startup->parent      = sess->caller_task;
+    startup->parent_sig  = ready_sig;
+    startup->ready_ok    = FALSE;
+    s_disp_startup       = startup;
+
+    /* Spawn the dispatcher Process.  DOSBase is held globally (opened
+     * lazily, never closed) so the just-started Process can rely on
+     * dos.library staying open for its entire lifetime. */
     {
-        if (attempt > 0)
-        {
-            struct Library *DOSBase = OpenLibrary((STRPTR)"dos.library", 0);
-            if (DOSBase) { Delay(50); CloseLibrary(DOSBase); } /* ~1s */
+        struct Library *DOSBase = get_dosbase(SysBase);
+        struct Process *proc = NULL;
+        if (DOSBase) {
+            proc = CreateNewProcTags(
+                NP_Entry,     (Tag)dispatcher_entry,
+                NP_Name,      (Tag)DISP_TASK_NAME,
+                NP_StackSize, (Tag)DISP_STACK_SIZE,
+                NP_Priority,  (Tag)DISP_TASK_PRI,
+                TAG_DONE);
         }
-
-        port = CreateMsgPort();
-        if (!port) { FreeVec(sess); return NULL; }
-
-        ior = (struct A314_IORequest *)CreateIORequest(port,
-                                        sizeof(struct A314_IORequest));
-        if (!ior) { DeleteMsgPort(port); FreeVec(sess); return NULL; }
-
-        if (OpenDevice((STRPTR)A314_NAME, 0, (struct IORequest *)ior, 0) != 0) {
-            DeleteIORequest((struct IORequest *)ior);
-            DeleteMsgPort(port);
-            port = NULL; ior = NULL;
-            continue;
+        if (!proc) {
+            FreeMem(startup, sizeof(*startup));
+            s_disp_startup = NULL;
+            ReleaseSemaphore(&s_disp_startup_sema);
+            goto fail_sig;
         }
-
-        /* Connect to bsdsocket service on the Pi.
-         * Use a monotonically increasing counter for the socket ID rather than
-         * the session address.  The a314 device rejects A314_CONNECT for a
-         * socket ID it just closed — and exec's free-list returns the same
-         * address on the next AllocVec, so (ULONG)sess repeats immediately
-         * on every second open.  The counter never repeats within one boot. */
-        ior->a314_Socket             = ++base->next_socket_id;
-        ior->a314_Buffer             = (STRPTR)"bsdsocket";
-        ior->a314_Length             = 9;
-        ior->a314_Request.io_Command = A314_CONNECT;
-
-        if (DoIO((struct IORequest *)ior) == A314_CONNECT_OK)
-            break; /* connected */
-
-        CloseDevice((struct IORequest *)ior);
-        DeleteIORequest((struct IORequest *)ior);
-        DeleteMsgPort(port);
-        port = NULL; ior = NULL;
+        sess->disp_task = (struct Task *)proc;
     }
 
-    if (!port) { FreeVec(sess); return NULL; } /* all 5 attempts failed */
+    /* Wait for dispatcher to signal ready (or failure). */
+    sigs = Wait(1L << ready_sig);
+    (void)sigs;
+    FreeSignal(ready_sig);
 
-    /* Wire up hostent in the session (pointers never change) */
-    sess->haddr_list[0]   = (APTR)&sess->haddr;
-    sess->haddr_list[1]   = NULL;
-    sess->haliases[0]     = NULL;
-    sess->hent.h_name     = sess->hname;
-    sess->hent.h_aliases  = (char **)sess->haliases;
-    sess->hent.h_addrtype = AF_INET;
-    sess->hent.h_length   = 4;
-    sess->hent.h_addr_list= (char **)sess->haddr_list;
+    if (!startup->ready_ok) {
+        FreeMem(startup, sizeof(*startup));
+        ReleaseSemaphore(&s_disp_startup_sema);
+        sess->disp_task = NULL;
+        goto fail_port;
+    }
+    /* Pick up the port + kill-sig values the dispatcher filled in. */
+    sess->disp_port = startup->disp_port_out;
+    sess->disp_kill_sig = startup->kill_sig_out;
+    FreeMem(startup, sizeof(*startup));
+    ReleaseSemaphore(&s_disp_startup_sema);
 
-    /* Wire up servent in the session (pointers never change) */
-    sess->sent_aliases[0] = NULL;
-    sess->sent.s_name     = sess->sent_name;
-    sess->sent.s_aliases  = (char **)sess->sent_aliases;
-    sess->sent.s_proto    = sess->sent_proto;
+    /* Wire up the hostent skeleton */
+    sess->haddr_list[0]    = (APTR)&sess->haddr;
+    sess->haddr_list[1]    = NULL;
+    sess->haliases[0]      = NULL;
+    sess->hent.h_name      = sess->hname;
+    sess->hent.h_aliases   = (char **)sess->haliases;
+    sess->hent.h_addrtype  = AF_INET;
+    sess->hent.h_length    = 4;
+    sess->hent.h_addr_list = (char **)sess->haddr_list;
 
-    /* Wire up protoent in the session (pointers never change) */
-    sess->pent_aliases[0] = NULL;
-    sess->pent.p_name     = sess->pent_name;
-    sess->pent.p_aliases  = (char **)sess->pent_aliases;
-
-    sess->task = FindTask(NULL);
-    sess->port = port;
-    sess->ior  = ior;
+    /* Wire up the protoent skeleton (used by getprotobyname/number) */
+    sess->pent_aliases[0]  = NULL;
+    sess->pent.p_name      = sess->pent_name;
+    sess->pent.p_aliases   = (char **)sess->pent_aliases;
 
     AddTail((struct List *)&base->sessions, (struct Node *)&sess->node);
     base->lib.lib_OpenCnt++;
     return base;
+
+fail_sig:
+    FreeSignal(ready_sig);
+fail_port:
+    /* Nothing to do — the disp_port lives in the dispatcher task and is
+     * only handed to us via startup->disp_port_out on success. */
+fail_reply:
+    FreeSignal(sess->reply_sig_bit);
+fail:
+    FreeVec(sess);
+    return NULL;
 }
 
 void bsd_close_lib(struct BsdBase *base)
@@ -418,20 +574,35 @@ void bsd_close_lib(struct BsdBase *base)
     struct BsdSession *sess    = find_session(base);
 
     if (sess) {
+        struct Library *DOSBase = get_dosbase(SysBase);
         Remove((struct Node *)&sess->node);
 
-        sess->ior->a314_Request.io_Command = A314_EOS;
-        DoIO((struct IORequest *)sess->ior);
+        /* Ask dispatcher to exit, poll-wait for it to clear disp_task as
+         * the "I'm gone" indicator. */
+        if (sess->disp_task && sess->disp_kill_sig != -1) {
+            Signal(sess->disp_task, 1L << sess->disp_kill_sig);
+            while (sess->disp_task) {
+                if (DOSBase) Delay(1);   /* 1 tick = 20 ms */
+            }
+        }
 
-        CloseDevice((struct IORequest *)sess->ior);
-        DeleteIORequest((struct IORequest *)sess->ior);
-        DeleteMsgPort(sess->port);
+        /* disp_port and disp_kill_sig live in the dispatcher's task — it
+         * cleans them up itself before returning (and dos.library cleans up
+         * the dispatcher process). */
+        FreeSignal(sess->reply_sig_bit);
         FreeVec(sess);
     }
     base->lib.lib_OpenCnt--;
 }
 
-/* ---- errno --------------------------------------------------------------- */
+/* ---- Library functions called by the application ------------------------- */
+/*
+ * Each library function (called in the caller's task) just builds a request
+ * in sess->req, calls do_rpc, then translates the result.  The caller does
+ * exactly ONE Wait() per call.
+ */
+
+/* ---- errno ------------------------------------------------------------- */
 
 LONG bsd_errno(struct BsdBase *base __asm("a6"))
 {
@@ -442,510 +613,247 @@ LONG bsd_errno(struct BsdBase *base __asm("a6"))
 void bsd_seterrnoptr(APTR a0 __asm("a0"), LONG d0 __asm("d0"),
                      struct BsdBase *base __asm("a6"))
 {
-    /* Store caller's errno LONG* so do_rpc() writes errno after every call. */
     struct BsdSession *sess = find_session(base);
-    (void)d0;  /* size — we only support LONG (4-byte) errno */
-    if (sess)
-        sess->errno_ptr = (LONG *)a0;
+    (void)d0;
+    if (sess) sess->errno_ptr = (LONG *)a0;
 }
 
-/* ---- socket() ------------------------------------------------------------ */
+/* Helper: after a do_rpc, write the errno to caller's errno cell if set. */
+static void propagate_errno(struct BsdSession *sess)
+{
+    if (sess->errno_ptr) *sess->errno_ptr = sess->errno_val;
+}
+
+/* ---- socket() --------------------------------------------------------- */
 
 LONG bsd_socket(LONG domain __asm("d0"), LONG type __asm("d1"),
-                LONG proto  __asm("d2"), struct BsdBase *base __asm("a6"))
+                LONG proto __asm("d2"), struct BsdBase *base __asm("a6"))
 {
-    struct ExecBase   *SysBase = base->SysBase;
-    struct BsdSession *sess    = find_session(base);
-    (void)SysBase;
-    if (!sess) { return -1; }
-
-    /* args: domain(2) type(2) protocol(2) */
-    fill_hdr(sess, BSDOP_SOCKET, 6);
-    w16(&sess->io_buf[4], (UWORD)domain);
-    w16(&sess->io_buf[6], (UWORD)type);
-    w16(&sess->io_buf[8], (UWORD)proto);
-    return RPC_RET(do_rpc(sess, base->SysBase, 10));
-}
-
-/* ---- bind() -------------------------------------------------------------- */
-
-LONG bsd_bind(LONG fd __asm("d0"), APTR sa __asm("a0"), LONG addrlen __asm("d1"),
-              struct BsdBase *base __asm("a6"))
-{
-    struct ExecBase   *SysBase = base->SysBase;
-    struct BsdSession *sess    = find_session(base);
-    UBYTE *p, *src;
-    UWORD  i, alen;
-    (void)SysBase;
-    if (!sess) return -1;
-    if (addrlen < 0 || addrlen > 64) addrlen = 16;
-
-    alen = 3 + (UWORD)addrlen; /* fd(2) addrlen(1) addr[] */
-    fill_hdr(sess, BSDOP_BIND, alen);
-    p = &sess->io_buf[4];
-    w16(p, (UWORD)fd); p += 2;
-    *p++ = (UBYTE)addrlen;
-    src = (UBYTE *)sa;
-    for (i = 0; i < (UWORD)addrlen; i++) *p++ = src[i];
-    return RPC_ZERO(do_rpc(sess, base->SysBase, 4 + alen));
-}
-
-/* ---- listen() ------------------------------------------------------------ */
-
-LONG bsd_listen(LONG fd __asm("d0"), LONG backlog __asm("d1"),
-                struct BsdBase *base __asm("a6"))
-{
-    struct ExecBase   *SysBase = base->SysBase;
-    struct BsdSession *sess    = find_session(base);
-    (void)SysBase;
+    struct BsdSession *sess = find_session(base);
     if (!sess) return -1;
 
-    fill_hdr(sess, BSDOP_LISTEN, 4);
-    w16(&sess->io_buf[4], (UWORD)fd);
-    w16(&sess->io_buf[6], (UWORD)backlog);
-    return RPC_ZERO(do_rpc(sess, base->SysBase, 8));
+    sess->req.opcode = BSDOP_SOCKET;
+    sess->req.arglen = 6;
+    w16(&sess->req.args[0], (UWORD)domain);
+    w16(&sess->req.args[2], (UWORD)type);
+    w16(&sess->req.args[4], (UWORD)proto);
+    sess->req.indata = NULL; sess->req.inlen = 0;
+    sess->req.outdata = NULL; sess->req.outmax = 0;
+    do_rpc(sess);
+    propagate_errno(sess);
+    return sess->req.result;
 }
 
-/* ---- accept() ------------------------------------------------------------ */
+/* ---- close() ---------------------------------------------------------- */
 
-LONG bsd_accept(LONG fd __asm("d0"), APTR sa __asm("a0"), LONG *addrlen __asm("a1"),
-                struct BsdBase *base __asm("a6"))
+LONG bsd_closesocket(LONG fd __asm("d0"), struct BsdBase *base __asm("a6"))
 {
-    struct ExecBase   *SysBase = base->SysBase;
-    struct BsdSession *sess    = find_session(base);
-    struct BsdRspHdr  *rsp;
-    LONG   r;
-    UBYTE *data;
-    UBYTE  alen;
-    UWORD  i;
-    (void)SysBase;
+    struct BsdSession *sess = find_session(base);
     if (!sess) return -1;
-
-    fill_hdr(sess, BSDOP_ACCEPT, 2);
-    w16(&sess->io_buf[4], (UWORD)fd);
-    r = do_rpc(sess, base->SysBase, 6);
-    if (r < 0 || !sa || !addrlen) return r;
-
-    rsp  = (struct BsdRspHdr *)sess->io_buf;
-    data = sess->io_buf + BSD_RSP_HDR_SIZE;
-    if (rsp->datalen < 1) return r;
-
-    alen = data[0]; /* first byte = addrlen */
-    if (addrlen) *addrlen = (LONG)alen;
-    if (sa && alen > 0) {
-        UBYTE *dst = (UBYTE *)sa;
-        for (i = 0; i < alen && i < 64; i++) dst[i] = data[1 + i];
-    }
-    return r;
+    sess->req.opcode = BSDOP_CLOSE;
+    sess->req.arglen = 2;
+    w16(&sess->req.args[0], (UWORD)fd);
+    sess->req.indata = NULL; sess->req.inlen = 0;
+    sess->req.outdata = NULL; sess->req.outmax = 0;
+    do_rpc(sess);
+    propagate_errno(sess);
+    return sess->req.result;
 }
 
-/* ---- connect() ----------------------------------------------------------- */
+/* ---- connect() -------------------------------------------------------- */
 
 LONG bsd_connect(LONG fd __asm("d0"), APTR sa __asm("a0"), LONG addrlen __asm("d1"),
                  struct BsdBase *base __asm("a6"))
 {
-    struct ExecBase   *SysBase = base->SysBase;
-    struct BsdSession *sess    = find_session(base);
-    UBYTE *p, *src;
-    UWORD  i, alen;
-    (void)SysBase;
+    struct BsdSession *sess = find_session(base);
+    UWORD i;
     if (!sess) return -1;
     if (addrlen < 0 || addrlen > 64) addrlen = 16;
 
-    alen = 3 + (UWORD)addrlen;
-    fill_hdr(sess, BSDOP_CONNECT, alen);
-    p = &sess->io_buf[4];
-    w16(p, (UWORD)fd); p += 2;
-    *p++ = (UBYTE)addrlen;
-    src = (UBYTE *)sa;
-    for (i = 0; i < (UWORD)addrlen; i++) *p++ = src[i];
-    return RPC_ZERO(do_rpc(sess, base->SysBase, 4 + alen));
+    sess->req.opcode = BSDOP_CONNECT;
+    sess->req.arglen = 3 + (UWORD)addrlen;
+    w16(&sess->req.args[0], (UWORD)fd);
+    sess->req.args[2] = (UBYTE)addrlen;
+    for (i = 0; i < (UWORD)addrlen; i++)
+        sess->req.args[3 + i] = ((UBYTE *)sa)[i];
+    sess->req.indata = NULL; sess->req.inlen = 0;
+    sess->req.outdata = NULL; sess->req.outmax = 0;
+    do_rpc(sess);
+    propagate_errno(sess);
+    return sess->req.result;
 }
 
-/* ---- send() -------------------------------------------------------------- */
+/* ---- send() ----------------------------------------------------------- */
 
 LONG bsd_send(LONG fd __asm("d0"), APTR buf __asm("a0"), LONG len __asm("d1"),
               LONG flags __asm("d2"), struct BsdBase *base __asm("a6"))
 {
-    struct ExecBase   *SysBase = base->SysBase;
-    struct BsdSession *sess    = find_session(base);
-    UBYTE *src;
-    LONG   total, r;
-    UWORD  ulen, alen, i;
-    (void)SysBase;
+    struct BsdSession *sess = find_session(base);
     if (!sess || len <= 0) return (len == 0) ? 0 : -1;
 
-    /*
-     * Loop to handle HTTP requests (and any payload) larger than
-     * BSD_MAX_DATA_SEND (242 bytes) per A314 message.  Without this loop,
-     * a request larger than 242 bytes is truncated: bsd_send returns 242,
-     * the application thinks all data was sent, the server receives an
-     * incomplete request (no trailing \r\n\r\n), waits, then closes.
-     *
-     * This mirrors the recv loop in bsd_recv which exists for the same
-     * reason (smb2fs large reads).
-     *
-     * On error with no bytes yet → return error.
-     * On error after partial data → return partial count (POSIX semantics).
-     * If Pi returns fewer bytes than requested (non-blocking buffer full) →
-     *   stop looping so the caller can react to the short send.
-     */
-    src   = (UBYTE *)buf;
-    total = 0;
-
-    do {
-        ulen = ((len - total) > (LONG)BSD_MAX_DATA_SEND)
-               ? BSD_MAX_DATA_SEND
-               : (UWORD)(len - total);
-        alen = 6 + ulen; /* fd(2) flags(2) datalen(2) data[] */
-
-        fill_hdr(sess, BSDOP_SEND, alen);
-        w16(&sess->io_buf[4], (UWORD)fd);
-        w16(&sess->io_buf[6], (UWORD)flags);
-        w16(&sess->io_buf[8], ulen);
-        for (i = 0; i < ulen; i++) sess->io_buf[10 + i] = src[total + i];
-
-        r = do_rpc(sess, base->SysBase, 4 + alen);
-        if (r < 0) return (total > 0) ? total : -1;
-
-        total += r;
-
-        /* If Pi forwarded fewer bytes than we asked (non-blocking socket
-         * buffer full, or short write), stop here so the caller sees the
-         * partial count and can retry the rest. */
-        if (r < (LONG)ulen) break;
-
-    } while (total < len);
-
-    return total;
+    sess->req.opcode = BSDOP_SEND;
+    sess->req.arglen = 4;
+    w16(&sess->req.args[0], (UWORD)fd);
+    w16(&sess->req.args[2], (UWORD)flags);
+    sess->req.indata = buf;
+    sess->req.inlen  = (ULONG)len;
+    sess->req.outdata = NULL; sess->req.outmax = 0;
+    do_rpc(sess);
+    propagate_errno(sess);
+    return sess->req.result;
 }
 
-/* ---- recv() -------------------------------------------------------------- */
-/*
- * Loop until all 'len' bytes have been received (stream semantics).
- *
- * Each A314 RPC is capped at BSD_MAX_DATA_RECV (245) bytes.  Applications
- * like smb2fs/libsmb2 issue large recv() calls (e.g. recv(fd,buf,65536,0))
- * and rely on getting exactly 'len' bytes back from a blocking socket — they
- * do NOT loop on partial reads.  Without this loop the Amiga receives only
- * 245 bytes of what it thinks is a complete SMB2 READ payload, interprets
- * garbage as protocol fields, and crashes.
- *
- * Termination: EOF (r == 0) or error (r < 0).
- *   - Error with no bytes yet → return the error.
- *   - Error after partial data → return the partial count so the caller can
- *     detect the short-read on its next call (matching POSIX stream semantics).
- */
+/* ---- recv() ----------------------------------------------------------- */
+
 LONG bsd_recv(LONG fd __asm("d0"), APTR buf __asm("a0"), LONG len __asm("d1"),
               LONG flags __asm("d2"), struct BsdBase *base __asm("a6"))
 {
-    struct ExecBase   *SysBase = base->SysBase;
-    struct BsdSession *sess    = find_session(base);
-    struct BsdRspHdr  *rsp;
-    LONG   total, r;
-    UWORD  want, n, i;
-    UBYTE *dst, *src;
-    (void)SysBase;
+    struct BsdSession *sess = find_session(base);
     if (!sess || len <= 0) return (len == 0) ? 0 : -1;
 
-    dst   = (UBYTE *)buf;
-    total = 0;
-
-    do {
-        want = ((len - total) > (LONG)BSD_MAX_DATA_RECV)
-               ? BSD_MAX_DATA_RECV
-               : (UWORD)(len - total);
-
-        fill_hdr(sess, BSDOP_RECV, 6);
-        w16(&sess->io_buf[4], (UWORD)fd);
-        w16(&sess->io_buf[6], (UWORD)flags);
-        w16(&sess->io_buf[8], want);
-
-        r = do_rpc(sess, base->SysBase, 10);
-        if (r < 0) return (total > 0) ? total : r;
-        if (r == 0) break; /* EOF / connection closed */
-
-        rsp = (struct BsdRspHdr *)sess->io_buf;
-        n   = rsp->datalen;
-        if ((LONG)n > len - total) n = (UWORD)(len - total);
-
-        src = sess->io_buf + BSD_RSP_HDR_SIZE;
-        for (i = 0; i < n; i++) dst[total + i] = src[i];
-        total += (LONG)n;
-
-        /* MSG_PEEK does not consume data from the socket buffer.
-         * Every repeated call returns the same bytes from the start.
-         * Loop only once so callers get a single consistent snapshot. */
-        if (flags & MSG_PEEK) break;
-
-        /* POSIX semantics: a blocking recv() returns as soon as any data is
-         * available — it does NOT guarantee filling the caller's buffer.
-         * Only MSG_WAITALL may loop to accumulate all len bytes.
-         *
-         * Looping unconditionally for blocking sockets was wrong: it kept
-         * calling do_rpc after the server finished sending (e.g. at HTTP
-         * EOF), causing the Pi's sock.recv() to block (keep-alive) or
-         * return stale data, breaking downloads with an assertion failure
-         * in wget's progress code (percentage > 100). */
-        if (!(flags & MSG_WAITALL))
-            break;
-
-    } while (total < len);
-
-    return total;
+    sess->req.opcode = BSDOP_RECV;
+    sess->req.arglen = 8;
+    w16(&sess->req.args[0], (UWORD)fd);
+    w16(&sess->req.args[2], (UWORD)flags);
+    w32(&sess->req.args[4], (ULONG)len);
+    sess->req.indata = NULL; sess->req.inlen = 0;
+    sess->req.outdata = buf;
+    sess->req.outmax  = (ULONG)len;
+    do_rpc(sess);
+    propagate_errno(sess);
+    return sess->req.result;
 }
 
-/* ---- sendto() ------------------------------------------------------------ */
+/* ---- gethostbyname() -------------------------------------------------- */
 
-LONG bsd_sendto(LONG fd __asm("d0"), APTR buf __asm("a0"), LONG len __asm("d1"),
-                LONG flags __asm("d2"), APTR sa __asm("a1"), LONG addrlen __asm("d3"),
-                struct BsdBase *base __asm("a6"))
+struct hostent *bsd_gethostbyname(STRPTR name __asm("a0"),
+                                   struct BsdBase *base __asm("a6"))
 {
-    struct ExecBase   *SysBase = base->SysBase;
-    struct BsdSession *sess    = find_session(base);
-    UBYTE *p, *src;
-    UWORD  ulen, alen, saddrlen, i;
-    (void)SysBase;
-    if (!sess || len <= 0) return -1;
+    struct BsdSession *sess = find_session(base);
+    UBYTE namelen, i;
+    UBYTE addr_buf[16]; /* up to 4 IPv4 addrs */
+    if (!sess || !name) return NULL;
 
-    /* sendto request = 4 REQ hdr + fd(2)+flags(2)+alen(1)+addr[]+dlen(2)+data[]
-     * = 4 + 4 + 1 + saddrlen + 2 + ulen = 11 + saddrlen + ulen ≤ 252
-     * With saddrlen ≤ 16 (IPv4): ulen ≤ 252 - 11 - 16 = 225 */
-    saddrlen = (addrlen < 0 || addrlen > 64) ? 16 : (UWORD)addrlen;
-    { UWORD dmax = A314_MAX_PAYLOAD - 11 - saddrlen;
-      ulen = (len > (LONG)dmax) ? dmax : (UWORD)len; }
-    alen     = 4 + 1 + saddrlen + 2 + ulen; /* fd(2) flags(2) alen(1) addr[] dlen(2) data[] */
+    namelen = 0;
+    while (name[namelen] && namelen < 200) namelen++;
 
-    fill_hdr(sess, BSDOP_SENDTO, alen);
-    p = &sess->io_buf[4];
-    w16(p, (UWORD)fd);    p += 2;
-    w16(p, (UWORD)flags); p += 2;
-    *p++ = (UBYTE)saddrlen;
-    src = (UBYTE *)sa;
-    for (i = 0; i < saddrlen; i++) *p++ = src[i];
-    w16(p, ulen); p += 2;
-    src = (UBYTE *)buf;
-    for (i = 0; i < ulen; i++) *p++ = src[i];
-    return RPC_RET(do_rpc(sess, base->SysBase, 4 + alen));
+    sess->req.opcode = BSDOP_GETHOSTBYNAME;
+    sess->req.arglen = 1 + namelen;
+    sess->req.args[0] = namelen;
+    for (i = 0; i < namelen; i++) sess->req.args[1 + i] = (UBYTE)name[i];
+    sess->req.indata = NULL; sess->req.inlen = 0;
+    sess->req.outdata = addr_buf;
+    sess->req.outmax  = sizeof addr_buf;
+    do_rpc(sess);
+    propagate_errno(sess);
+
+    if (sess->req.result <= 0) return NULL;
+
+    /* Take the first address. */
+    sess->haddr = ((ULONG)addr_buf[0] << 24) | ((ULONG)addr_buf[1] << 16)
+                | ((ULONG)addr_buf[2] <<  8) |  (ULONG)addr_buf[3];
+    for (i = 0; i < namelen; i++) sess->hname[i] = name[i];
+    sess->hname[namelen] = 0;
+    return &sess->hent;
 }
 
-/* ---- recvfrom() ---------------------------------------------------------- */
+/* ---- inet_ntoa() — local-only ----------------------------------------- */
 
-LONG bsd_recvfrom(LONG fd __asm("d0"), APTR buf __asm("a0"), LONG len __asm("d1"),
-                  LONG flags __asm("d2"), APTR sa __asm("a1"), LONG *addrlen __asm("a2"),
-                  struct BsdBase *base __asm("a6"))
+STRPTR bsd_inet_ntoa(ULONG addr __asm("d0"), struct BsdBase *base __asm("a6"))
 {
-    struct ExecBase   *SysBase = base->SysBase;
-    struct BsdSession *sess    = find_session(base);
-    struct BsdRspHdr  *rsp;
-    LONG   r;
-    UWORD  n, i;
-    UBYTE *data, *dst;
-    (void)SysBase;
-    if (!sess || len <= 0) return -1;
+    struct BsdSession *sess = find_session(base);
+    BYTE  *p;
+    UWORD  pos;
+    UBYTE  bytes[4];
+    UBYTE  i, v;
 
-    /* recvfrom response = 7 RSP hdr + data + 1 addrlen + addr (≤16)
-     * = 7 + data + 17 → data ≤ 252 - 7 - 17 = 228 */
-    fill_hdr(sess, BSDOP_RECVFROM, 6);
-    w16(&sess->io_buf[4], (UWORD)fd);
-    w16(&sess->io_buf[6], (UWORD)flags);
-    w16(&sess->io_buf[8], (len > 228) ? 228 : (UWORD)len);
+    if (!sess) return (STRPTR)"0.0.0.0";
 
-    r = do_rpc(sess, base->SysBase, 10);
-    if (r <= 0) return r;
+    bytes[0] = (UBYTE)(addr >> 24);
+    bytes[1] = (UBYTE)(addr >> 16);
+    bytes[2] = (UBYTE)(addr >>  8);
+    bytes[3] = (UBYTE)addr;
 
-    /* data = recv_bytes + addrlen(1) + addr[] */
-    rsp  = (struct BsdRspHdr *)sess->io_buf;
-    data = sess->io_buf + BSD_RSP_HDR_SIZE;
-    n    = (UWORD)r;
-    if (n > (UWORD)len) n = (UWORD)len;
-    dst  = (UBYTE *)buf;
-    for (i = 0; i < n; i++) dst[i] = data[i];
-
-    if (sa && addrlen && rsp->datalen > n) {
-        UBYTE alen2 = data[n];
-        if (addrlen) *addrlen = alen2;
-        if (sa) {
-            UBYTE *s2 = (UBYTE *)sa;
-            for (i = 0; i < alen2 && i < 64; i++) s2[i] = data[n + 1 + i];
-        }
+    p   = sess->ntoa_buf;
+    pos = 0;
+    for (i = 0; i < 4; i++) {
+        v = bytes[i];
+        if (v >= 100) { p[pos++] = '0' + v/100; v %= 100;
+                        p[pos++] = '0' + v/10;  v %= 10; }
+        else if (v >= 10) { p[pos++] = '0' + v/10; v %= 10; }
+        p[pos++] = '0' + v;
+        if (i < 3) p[pos++] = '.';
     }
-    return (LONG)n;
+    p[pos] = 0;
+    return (STRPTR)p;
 }
 
-/* ---- shutdown() ---------------------------------------------------------- */
+/* ---- inet_addr() — local-only ----------------------------------------- */
+
+ULONG bsd_inet_addr(STRPTR s __asm("a0"), struct BsdBase *base __asm("a6"))
+{
+    ULONG result = 0, cur = 0;
+    UBYTE parts = 0, c;
+    (void)base;
+    if (!s) return 0xFFFFFFFFUL;
+    while ((c = (UBYTE)*s++) != 0) {
+        if (c >= '0' && c <= '9') {
+            cur = cur * 10 + (c - '0');
+            if (cur > 255) return 0xFFFFFFFFUL;
+        } else if (c == '.') {
+            result = (result << 8) | (cur & 0xFF);
+            cur = 0; parts++;
+            if (parts > 3) return 0xFFFFFFFFUL;
+        } else return 0xFFFFFFFFUL;
+    }
+    result = (result << 8) | (cur & 0xFF);
+    parts++;
+    if (parts != 4) return 0xFFFFFFFFUL;
+    return result;
+}
+
+/* ---- shutdown() ------------------------------------------------------- */
 
 LONG bsd_shutdown(LONG fd __asm("d0"), LONG how __asm("d1"),
                   struct BsdBase *base __asm("a6"))
 {
-    struct ExecBase   *SysBase = base->SysBase;
-    struct BsdSession *sess    = find_session(base);
-    (void)SysBase;
-    if (!sess) return -1;
-
-    fill_hdr(sess, BSDOP_SHUTDOWN, 4);
-    w16(&sess->io_buf[4], (UWORD)fd);
-    w16(&sess->io_buf[6], (UWORD)how);
-    return RPC_ZERO(do_rpc(sess, base->SysBase, 8));
-}
-
-/* ---- setsockopt() -------------------------------------------------------- */
-
-LONG bsd_setsockopt(LONG fd __asm("d0"), LONG level __asm("d1"), LONG optname __asm("d2"),
-                    APTR optval __asm("a0"), LONG optlen __asm("d3"),
-                    struct BsdBase *base __asm("a6"))
-{
-    struct ExecBase   *SysBase = base->SysBase;
-    struct BsdSession *sess    = find_session(base);
-    UBYTE *p, *src;
-    UWORD  uoptlen, alen, i;
-    (void)SysBase;
-    if (!sess) return -1;
-
-    uoptlen = (optlen < 0 || optlen > 64) ? 4 : (UWORD)optlen;
-    alen    = 8 + uoptlen; /* fd(2) level(2) optname(2) optlen(2) optval[] */
-
-    fill_hdr(sess, BSDOP_SETSOCKOPT, alen);
-    p = &sess->io_buf[4];
-    w16(p, (UWORD)fd);      p += 2;
-    w16(p, (UWORD)level);   p += 2;
-    w16(p, (UWORD)optname); p += 2;
-    w16(p, uoptlen);        p += 2;
-    src = (UBYTE *)optval;
-    for (i = 0; i < uoptlen; i++) *p++ = src[i];
-    return RPC_ZERO(do_rpc(sess, base->SysBase, 4 + alen));
-}
-
-/* ---- getsockopt() -------------------------------------------------------- */
-
-LONG bsd_getsockopt(LONG fd __asm("d0"), LONG level __asm("d1"), LONG optname __asm("d2"),
-                    APTR optval __asm("a0"), LONG *optlen __asm("a1"),
-                    struct BsdBase *base __asm("a6"))
-{
-    struct ExecBase   *SysBase = base->SysBase;
-    struct BsdSession *sess    = find_session(base);
-    struct BsdRspHdr  *rsp;
-    LONG   r;
-    UBYTE *data, *dst;
-    UWORD  n, i;
-    (void)SysBase;
-    if (!sess) return -1;
-
-    fill_hdr(sess, BSDOP_GETSOCKOPT, 6);
-    w16(&sess->io_buf[4], (UWORD)fd);
-    w16(&sess->io_buf[6], (UWORD)level);
-    w16(&sess->io_buf[8], (UWORD)optname);
-
-    r = do_rpc(sess, base->SysBase, 10);
-    if (r < 0 || !optval || !optlen) return r;
-
-    /* data = optlen(2) optval[] */
-    rsp  = (struct BsdRspHdr *)sess->io_buf;
-    data = sess->io_buf + BSD_RSP_HDR_SIZE;
-    if (rsp->datalen < 2) return r;
-
-    n = ((UWORD)data[0] << 8) | data[1];
-    if (optlen) *optlen = (LONG)n;
-    dst = (UBYTE *)optval;
-    for (i = 0; i < n && i < 64; i++) dst[i] = data[2 + i];
-    return r;
-}
-
-/* ---- getsockname / getpeername ------------------------------------------ */
-
-static LONG _sockname(UBYTE opcode, LONG fd, APTR sa, LONG *addrlen,
-                      struct BsdSession *sess, struct ExecBase *SysBase)
-{
-    struct BsdRspHdr *rsp;
-    LONG   r;
-    UBYTE *data, *dst;
-    UBYTE  alen;
-    UWORD  i;
-    (void)SysBase;
-
-    fill_hdr(sess, opcode, 2);
-    w16(&sess->io_buf[4], (UWORD)fd);
-
-    r = do_rpc(sess, SysBase, 6);
-    if (r < 0 || !sa || !addrlen) return r;
-
-    rsp  = (struct BsdRspHdr *)sess->io_buf;
-    data = sess->io_buf + BSD_RSP_HDR_SIZE;
-    if (rsp->datalen < 1) return r;
-
-    alen = data[0];
-    if (addrlen) *addrlen = (LONG)alen;
-    dst = (UBYTE *)sa;
-    for (i = 0; i < alen && i < 64; i++) dst[i] = data[1 + i];
-    return r;
-}
-
-LONG bsd_getsockname(LONG fd __asm("d0"), APTR sa __asm("a0"), LONG *addrlen __asm("a1"),
-                     struct BsdBase *base __asm("a6"))
-{
     struct BsdSession *sess = find_session(base);
     if (!sess) return -1;
-    return _sockname(BSDOP_GETSOCKNAME, fd, sa, addrlen, sess, base->SysBase);
+    sess->req.opcode = BSDOP_SHUTDOWN;
+    sess->req.arglen = 4;
+    w16(&sess->req.args[0], (UWORD)fd);
+    w16(&sess->req.args[2], (UWORD)how);
+    sess->req.indata = NULL; sess->req.inlen = 0;
+    sess->req.outdata = NULL; sess->req.outmax = 0;
+    do_rpc(sess);
+    propagate_errno(sess);
+    return sess->req.result;
 }
 
-LONG bsd_getpeername(LONG fd __asm("d0"), APTR sa __asm("a0"), LONG *addrlen __asm("a1"),
-                     struct BsdBase *base __asm("a6"))
-{
-    struct BsdSession *sess = find_session(base);
-    if (!sess) return -1;
-    return _sockname(BSDOP_GETPEERNAME, fd, sa, addrlen, sess, base->SysBase);
-}
-
-/* ---- ioctlsocket() ------------------------------------------------------- */
+/* ---- ioctlsocket() ---------------------------------------------------- */
 
 LONG bsd_ioctlsocket(LONG fd __asm("d0"), LONG request __asm("d1"),
                      APTR argp __asm("a0"), struct BsdBase *base __asm("a6"))
 {
-    struct ExecBase   *SysBase = base->SysBase;
-    struct BsdSession *sess    = find_session(base);
-    ULONG  arg;
-    (void)SysBase;
+    struct BsdSession *sess = find_session(base);
+    ULONG arg;
     if (!sess) return -1;
-
-    arg = argp ? *(ULONG *)argp : 0UL;
-
-    /* Track non-blocking mode locally so bsd_recv() can decide whether
-     * to break on a short read (non-blocking: buffer drained, return now)
-     * or keep looping (blocking: more data is on the way from the server).
-     * FIONBIO = 0x8004667e in AmiTCP (matches BSD/SunOS ioctl encoding). */
-    if ((ULONG)request == 0x8004667eUL && (ULONG)fd < 32UL) {
-        if (arg)
-            sess->nonblock_fds |=  (1UL << (ULONG)fd);
-        else
-            sess->nonblock_fds &= ~(1UL << (ULONG)fd);
-    }
-
-    fill_hdr(sess, BSDOP_IOCTL, 10);
-    w16(&sess->io_buf[4],  (UWORD)fd);
-    w32(&sess->io_buf[6],  (ULONG)request);
-    w32(&sess->io_buf[10], arg);
-    return RPC_ZERO(do_rpc(sess, base->SysBase, 14));
+    arg = argp ? *(ULONG *)argp : 0;
+    sess->req.opcode = BSDOP_IOCTL;
+    sess->req.arglen = 10;
+    w16(&sess->req.args[0], (UWORD)fd);
+    w32(&sess->req.args[2], (ULONG)request);
+    w32(&sess->req.args[6], arg);
+    sess->req.indata = NULL; sess->req.inlen = 0;
+    sess->req.outdata = NULL; sess->req.outmax = 0;
+    do_rpc(sess);
+    propagate_errno(sess);
+    /* For FIONREAD, the count comes back in result. */
+    if (argp && (ULONG)request == 0x4004667fUL) *(ULONG *)argp = (ULONG)sess->req.result;
+    return sess->req.result;
 }
 
-/* ---- closesocket() ------------------------------------------------------- */
-
-LONG bsd_closesocket(LONG fd __asm("d0"), struct BsdBase *base __asm("a6"))
-{
-    struct ExecBase   *SysBase = base->SysBase;
-    struct BsdSession *sess    = find_session(base);
-    (void)SysBase;
-    if (!sess) return -1;
-
-    /* Clear non-blocking flag when the socket is closed. */
-    if ((ULONG)fd < 32UL)
-        sess->nonblock_fds &= ~(1UL << (ULONG)fd);
-
-    fill_hdr(sess, BSDOP_CLOSE, 2);
-    w16(&sess->io_buf[4], (UWORD)fd);
-    return RPC_ZERO(do_rpc(sess, base->SysBase, 6));
-}
-
-/* ---- waitselect() -------------------------------------------------------- */
+/* ---- waitselect() ----------------------------------------------------- */
 
 LONG bsd_waitselect(LONG nfds __asm("d0"),
                     fd_set *rfds __asm("a0"), fd_set *wfds __asm("a1"),
@@ -954,72 +862,317 @@ LONG bsd_waitselect(LONG nfds __asm("d0"),
 {
     struct ExecBase   *SysBase = base->SysBase;
     struct BsdSession *sess    = find_session(base);
-    struct BsdRspHdr  *rsp;
+    UBYTE  out_buf[12];
     ULONG  rm, wm, em, tv_sec, tv_usec;
-    LONG   r;
-    UBYTE *data;
     if (!sess) return -1;
 
-    rm = rfds ? *rfds : 0UL;
-    wm = wfds ? *wfds : 0UL;
-    em = efds ? *efds : 0UL;
+    rm = rfds ? *rfds : 0;
+    wm = wfds ? *wfds : 0;
+    em = efds ? *efds : 0;
     if (tv) { tv_sec = (ULONG)tv->tv_sec; tv_usec = (ULONG)tv->tv_usec; }
-    else    { tv_sec = 0xFFFFFFFFUL;      tv_usec = 0UL; }
+    else    { tv_sec = 0xffffffffUL; tv_usec = 0; }
 
-    /* nfds(2) rmask(4) wmask(4) emask(4) tv_sec(4) tv_usec(4) = 22 bytes */
-    fill_hdr(sess, BSDOP_WAITSELECT, 22);
-    w16(&sess->io_buf[4],  (UWORD)nfds);
-    w32(&sess->io_buf[6],  rm);
-    w32(&sess->io_buf[10], wm);
-    w32(&sess->io_buf[14], em);
-    w32(&sess->io_buf[18], tv_sec);
-    w32(&sess->io_buf[22], tv_usec);
+    sess->req.opcode = BSDOP_WAITSELECT;
+    sess->req.arglen = 22;
+    w16(&sess->req.args[0], (UWORD)nfds);
+    w32(&sess->req.args[2], rm);
+    w32(&sess->req.args[6], wm);
+    w32(&sess->req.args[10], em);
+    w32(&sess->req.args[14], tv_sec);
+    w32(&sess->req.args[18], tv_usec);
+    sess->req.indata = NULL; sess->req.inlen = 0;
+    sess->req.outdata = out_buf; sess->req.outmax = sizeof out_buf;
+    do_rpc(sess);
+    propagate_errno(sess);
 
-    r = do_rpc(sess, base->SysBase, 26);
-    /* Report whichever of the caller's signals fired while we were blocking,
-     * then CLEAR those signal bits — mirroring what exec's Wait() does when
-     * it returns.  Real AmiTCP WaitSelect calls Wait() internally; Wait()
-     * atomically reads and clears the signals that woke it up.  If we only
-     * read (SetSignal(0,0)) without clearing, any signal that fires once
-     * (e.g. SIGF_TIMER) stays set on the task and is returned on EVERY
-     * subsequent WaitSelect call, flooding wget/AmispeedTest with spurious
-     * timer events → near-zero delta_time → wrong speed display.
-     *
-     * SetSignal(0, *sigmask) atomically:
-     *   - clears all bits in *sigmask from the task's signal state
-     *   - returns the previous signal state (before the clear)
-     * Masking with *sigmask gives exactly which requested signals were pending. */
     if (sigmask) *sigmask = SetSignal(0UL, *sigmask) & *sigmask;
-    if (r < 0) return -1;
-
-    rsp  = (struct BsdRspHdr *)sess->io_buf;
-    data = sess->io_buf + BSD_RSP_HDR_SIZE;
-    if (rsp->datalen >= 12) {
-        if (rfds) *rfds = ((ULONG)data[0]<<24)|((ULONG)data[1]<<16)|((ULONG)data[2]<<8)|data[3];
-        if (wfds) *wfds = ((ULONG)data[4]<<24)|((ULONG)data[5]<<16)|((ULONG)data[6]<<8)|data[7];
-        if (efds) *efds = ((ULONG)data[8]<<24)|((ULONG)data[9]<<16)|((ULONG)data[10]<<8)|data[11];
-    }
-    return r;
+    if (sess->req.result < 0) return -1;
+    if (rfds) *rfds = ((ULONG)out_buf[0]<<24)|((ULONG)out_buf[1]<<16)|((ULONG)out_buf[2]<<8)|out_buf[3];
+    if (wfds) *wfds = ((ULONG)out_buf[4]<<24)|((ULONG)out_buf[5]<<16)|((ULONG)out_buf[6]<<8)|out_buf[7];
+    if (efds) *efds = ((ULONG)out_buf[8]<<24)|((ULONG)out_buf[9]<<16)|((ULONG)out_buf[10]<<8)|out_buf[11];
+    return sess->req.result;
 }
 
-/* ---- setsocketsignals() -------------------------------------------------- */
+/* ---- SocketBaseTagList ------------------------------------------------ */
+
+LONG bsd_socketbasetaglist(APTR taglist __asm("a0"), struct BsdBase *base __asm("a6"))
+{
+    struct BsdSession *sess = find_session(base);
+    ULONG *ti = (ULONG *)taglist;
+    if (!ti || !sess) return 0;
+    while (1) {
+        ULONG tag = ti[0], data = ti[1];
+        ti += 2;
+        if (tag == 0) break;
+        if (tag == 1) continue;
+        if (tag == 2) { ti = (ULONG *)(APTR)data; continue; }
+        if (tag == 3) { ti += data * 2; continue; }
+        /* SBTM_SETVAL(SBTC_ERRNOLONGPTR=24) = 0x80000031 */
+        if (tag == 0x80000031UL && data) sess->errno_ptr = (LONG *)data;
+        /* SBTM_SETREF variant = 0x80008031 */
+        else if (tag == 0x80008031UL && data) sess->errno_ptr = *((LONG **)data);
+        /* SBTM_SETVAL(SBTC_HERRNOLONGPTR=25) = 0x80000033 */
+        else if (tag == 0x80000033UL && data) {
+            sess->h_errno_ptr = (LONG *)data;
+            *sess->h_errno_ptr = 0;
+        }
+        else if (tag == 0x80008033UL && data) {
+            sess->h_errno_ptr = *((LONG **)data);
+            if (sess->h_errno_ptr) *sess->h_errno_ptr = 0;
+        }
+    }
+    return 0;
+}
+
+/* ---- bind() / listen() / accept() ------------------------------------- */
+
+LONG bsd_bind(LONG fd __asm("d0"), APTR sa __asm("a0"), LONG addrlen __asm("d1"),
+              struct BsdBase *base __asm("a6"))
+{
+    struct BsdSession *sess = find_session(base);
+    UWORD i;
+    if (!sess) return -1;
+    if (addrlen < 0 || addrlen > 64) addrlen = 16;
+    sess->req.opcode = BSDOP_BIND;
+    sess->req.arglen = 3 + (UWORD)addrlen;
+    w16(&sess->req.args[0], (UWORD)fd);
+    sess->req.args[2] = (UBYTE)addrlen;
+    for (i = 0; i < (UWORD)addrlen; i++)
+        sess->req.args[3 + i] = ((UBYTE *)sa)[i];
+    sess->req.indata = NULL; sess->req.inlen = 0;
+    sess->req.outdata = NULL; sess->req.outmax = 0;
+    do_rpc(sess);
+    propagate_errno(sess);
+    return sess->req.result;
+}
+
+LONG bsd_listen(LONG fd __asm("d0"), LONG backlog __asm("d1"),
+                struct BsdBase *base __asm("a6"))
+{
+    struct BsdSession *sess = find_session(base);
+    if (!sess) return -1;
+    sess->req.opcode = BSDOP_LISTEN;
+    sess->req.arglen = 4;
+    w16(&sess->req.args[0], (UWORD)fd);
+    w16(&sess->req.args[2], (UWORD)backlog);
+    sess->req.indata = NULL; sess->req.inlen = 0;
+    sess->req.outdata = NULL; sess->req.outmax = 0;
+    do_rpc(sess);
+    propagate_errno(sess);
+    return sess->req.result;
+}
+
+LONG bsd_accept(LONG fd __asm("d0"), APTR sa __asm("a0"), LONG *al __asm("a1"),
+                struct BsdBase *base __asm("a6"))
+{
+    struct BsdSession *sess = find_session(base);
+    UBYTE  out_buf[24];     /* alen(1) + sockaddr_in(16) */
+    UBYTE  alen, i;
+    if (!sess) return -1;
+    sess->req.opcode = BSDOP_ACCEPT;
+    sess->req.arglen = 2;
+    w16(&sess->req.args[0], (UWORD)fd);
+    sess->req.indata = NULL; sess->req.inlen = 0;
+    sess->req.outdata = out_buf; sess->req.outmax = sizeof out_buf;
+    do_rpc(sess);
+    propagate_errno(sess);
+    if (sess->req.result < 0) return -1;
+    /* out_buf[0] = addrlen, out_buf[1..] = sockaddr bytes */
+    alen = out_buf[0];
+    if (sa && al) {
+        LONG cap = *al;
+        if (cap < 0) cap = 0;
+        if (cap > (LONG)alen) cap = (LONG)alen;
+        for (i = 0; i < (UBYTE)cap; i++) ((UBYTE *)sa)[i] = out_buf[1 + i];
+        *al = (LONG)alen;
+    }
+    return sess->req.result;
+}
+
+/* ---- sendto() / recvfrom() ------------------------------------------- */
+
+LONG bsd_sendto(LONG fd __asm("d0"), APTR buf __asm("a0"), LONG len __asm("d1"),
+                LONG flags __asm("d2"), APTR sa __asm("a1"), LONG al __asm("d3"),
+                struct BsdBase *base __asm("a6"))
+{
+    struct BsdSession *sess = find_session(base);
+    UWORD i;
+    if (!sess || len <= 0) return (len == 0) ? 0 : -1;
+    if (al < 0 || al > 64) al = 16;
+    sess->req.opcode = BSDOP_SENDTO;
+    sess->req.arglen = 5 + (UWORD)al;
+    w16(&sess->req.args[0], (UWORD)fd);
+    w16(&sess->req.args[2], (UWORD)flags);
+    sess->req.args[4] = (UBYTE)al;
+    for (i = 0; i < (UWORD)al; i++) sess->req.args[5 + i] = ((UBYTE *)sa)[i];
+    sess->req.indata = buf;
+    sess->req.inlen  = (ULONG)len;
+    sess->req.outdata = NULL; sess->req.outmax = 0;
+    do_rpc(sess);
+    propagate_errno(sess);
+    return sess->req.result;
+}
+
+LONG bsd_recvfrom(LONG fd __asm("d0"), APTR buf __asm("a0"), LONG len __asm("d1"),
+                  LONG flags __asm("d2"), APTR sa __asm("a1"), LONG *al __asm("a2"),
+                  struct BsdBase *base __asm("a6"))
+{
+    /* Pi returns: addrlen(1) sockaddr(16) data[len].  We need a temp
+     * scratch buffer that fits the peer addr plus the data — allocate
+     * caller's len+17 to be safe.  For the common case we copy in two
+     * passes (peer addr extracted, data copied to caller's buf). */
+    struct ExecBase   *SysBase = base->SysBase;
+    struct BsdSession *sess    = find_session(base);
+    UBYTE  hdr_buf[17];
+    APTR   data_buf;
+    UBYTE  alen;
+    UWORD  i;
+    if (!sess || len <= 0) return (len == 0) ? 0 : -1;
+
+    /* For simplicity we ask Pi for the data into a scratch sized for hdr+data,
+     * but our outdata is fixed.  Workaround: tell dispatcher about a separate
+     * "hdr followed by caller buf" using a local stash + caller buf in one
+     * contiguous read.  Easier path: allocate a single buffer the dispatcher
+     * fills, then split. */
+    data_buf = AllocVec((ULONG)len + 17, MEMF_PUBLIC);
+    if (!data_buf) return -1;
+
+    sess->req.opcode = BSDOP_RECVFROM;
+    sess->req.arglen = 8;
+    w16(&sess->req.args[0], (UWORD)fd);
+    w16(&sess->req.args[2], (UWORD)flags);
+    w32(&sess->req.args[4], (ULONG)len);
+    sess->req.indata = NULL; sess->req.inlen = 0;
+    sess->req.outdata = data_buf;
+    sess->req.outmax  = (ULONG)len + 17;
+    do_rpc(sess);
+    propagate_errno(sess);
+
+    if (sess->req.result < 0) {
+        FreeVec(data_buf);
+        return -1;
+    }
+    /* layout: [0]=alen, [1..16]=sockaddr, [17..]=data */
+    alen = ((UBYTE *)data_buf)[0];
+    for (i = 0; i < 17; i++) hdr_buf[i] = ((UBYTE *)data_buf)[i];
+    for (i = 0; i < sess->req.result && i < len; i++)
+        ((UBYTE *)buf)[i] = ((UBYTE *)data_buf)[17 + i];
+
+    if (sa && al) {
+        LONG cap = *al;
+        if (cap < 0) cap = 0;
+        if (cap > 16) cap = 16;
+        for (i = 0; i < (UWORD)cap; i++) ((UBYTE *)sa)[i] = hdr_buf[1 + i];
+        *al = (LONG)alen;
+    }
+    FreeVec(data_buf);
+    return sess->req.result;
+}
+
+/* ---- getsockopt() / setsockopt() ------------------------------------- */
+
+LONG bsd_setsockopt(LONG fd __asm("d0"), LONG level __asm("d1"), LONG optname __asm("d2"),
+                    APTR optval __asm("a0"), LONG optlen __asm("d3"),
+                    struct BsdBase *base __asm("a6"))
+{
+    struct BsdSession *sess = find_session(base);
+    if (!sess) return -1;
+    if (optlen < 0 || optlen > 64) optlen = 4;
+    sess->req.opcode = BSDOP_SETSOCKOPT;
+    sess->req.arglen = 8;
+    w16(&sess->req.args[0], (UWORD)fd);
+    w16(&sess->req.args[2], (UWORD)level);
+    w16(&sess->req.args[4], (UWORD)optname);
+    w16(&sess->req.args[6], (UWORD)optlen);
+    sess->req.indata = optval;
+    sess->req.inlen  = (ULONG)optlen;
+    sess->req.outdata = NULL; sess->req.outmax = 0;
+    do_rpc(sess);
+    propagate_errno(sess);
+    return sess->req.result;
+}
+
+LONG bsd_getsockopt(LONG fd __asm("d0"), LONG level __asm("d1"), LONG optname __asm("d2"),
+                    APTR optval __asm("a0"), LONG *optlen __asm("a1"),
+                    struct BsdBase *base __asm("a6"))
+{
+    struct BsdSession *sess = find_session(base);
+    UBYTE  out_buf[68];     /* 2-byte length + up to 64 bytes optval */
+    UWORD  n, i;
+    LONG   maxlen;
+    if (!sess) return -1;
+    maxlen = optlen ? *optlen : 4;
+    if (maxlen < 0 || maxlen > 64) maxlen = 64;
+    sess->req.opcode = BSDOP_GETSOCKOPT;
+    sess->req.arglen = 8;
+    w16(&sess->req.args[0], (UWORD)fd);
+    w16(&sess->req.args[2], (UWORD)level);
+    w16(&sess->req.args[4], (UWORD)optname);
+    w16(&sess->req.args[6], (UWORD)maxlen);
+    sess->req.indata = NULL; sess->req.inlen = 0;
+    sess->req.outdata = out_buf; sess->req.outmax = sizeof out_buf;
+    do_rpc(sess);
+    propagate_errno(sess);
+    if (sess->req.result < 0) return -1;
+    /* out_buf = optlen(2 BE) optval[optlen] */
+    n = ((UWORD)out_buf[0] << 8) | out_buf[1];
+    if (n > 64) n = 64;
+    if (optval) {
+        LONG cap = maxlen < (LONG)n ? maxlen : (LONG)n;
+        for (i = 0; i < (UWORD)cap; i++) ((UBYTE *)optval)[i] = out_buf[2 + i];
+    }
+    if (optlen) *optlen = (LONG)n;
+    return 0;
+}
+
+/* ---- getsockname() / getpeername() ----------------------------------- */
+
+static LONG _sockname_rpc(struct BsdSession *sess, UBYTE opcode,
+                          LONG fd, APTR sa, LONG *al)
+{
+    UBYTE out_buf[24];
+    UBYTE alen, i;
+    sess->req.opcode = opcode;
+    sess->req.arglen = 2;
+    w16(&sess->req.args[0], (UWORD)fd);
+    sess->req.indata = NULL; sess->req.inlen = 0;
+    sess->req.outdata = out_buf; sess->req.outmax = sizeof out_buf;
+    do_rpc(sess);
+    propagate_errno(sess);
+    if (sess->req.result < 0) return -1;
+    alen = out_buf[0];
+    if (sa && al) {
+        LONG cap = *al;
+        if (cap < 0) cap = 0;
+        if (cap > (LONG)alen) cap = (LONG)alen;
+        for (i = 0; i < (UBYTE)cap; i++) ((UBYTE *)sa)[i] = out_buf[1 + i];
+        *al = (LONG)alen;
+    }
+    return 0;
+}
+
+LONG bsd_getsockname(LONG fd __asm("d0"), APTR sa __asm("a0"), LONG *al __asm("a1"),
+                     struct BsdBase *base __asm("a6"))
+{
+    struct BsdSession *sess = find_session(base);
+    if (!sess) return -1;
+    return _sockname_rpc(sess, BSDOP_GETSOCKNAME, fd, sa, al);
+}
+
+LONG bsd_getpeername(LONG fd __asm("d0"), APTR sa __asm("a0"), LONG *al __asm("a1"),
+                     struct BsdBase *base __asm("a6"))
+{
+    struct BsdSession *sess = find_session(base);
+    if (!sess) return -1;
+    return _sockname_rpc(sess, BSDOP_GETPEERNAME, fd, sa, al);
+}
 
 void bsd_setsocketsignals(ULONG d0 __asm("d0"), ULONG d1 __asm("d1"),
                           ULONG d2 __asm("d2"), struct BsdBase *base __asm("a6"))
-{
-    /* Not implemented — signal-driven sockets not supported */
-    (void)d0; (void)d1; (void)d2; (void)base;
-}
-
-/* ---- getdtablesize() ----------------------------------------------------- */
+{ (void)d0; (void)d1; (void)d2; (void)base; }
 
 LONG bsd_getdtablesize(struct BsdBase *base __asm("a6"))
-{
-    (void)base;
-    return 32; /* FD_SETSIZE */
-}
-
-/* ---- obtainsocket / releasesocket ---------------------------------------- */
+{ (void)base; return 32; }
 
 LONG bsd_obtainsocket(LONG d0 __asm("d0"), LONG d1 __asm("d1"),
                       LONG d2 __asm("d2"), LONG d3 __asm("d3"),
@@ -1034,187 +1187,48 @@ LONG bsd_releasecopyofsocket(LONG d0 __asm("d0"), LONG d1 __asm("d1"),
                               struct BsdBase *base __asm("a6"))
 { (void)d0; (void)d1; (void)base; return -1; }
 
-/* ---- inet_ntoa() --------------------------------------------------------- */
-
-STRPTR bsd_inet_ntoa(ULONG addr __asm("d0"), struct BsdBase *base __asm("a6"))
-{
-    struct BsdSession *sess = find_session(base);
-    BYTE  *p;
-    UWORD  pos;
-    UBYTE  bytes[4];
-    UBYTE  i;
-
-    if (!sess) return (STRPTR)"0.0.0.0";
-
-    bytes[0] = (UBYTE)(addr >> 24);
-    bytes[1] = (UBYTE)(addr >> 16);
-    bytes[2] = (UBYTE)(addr >>  8);
-    bytes[3] = (UBYTE)(addr);
-
-    p   = sess->ntoa_buf;
-    pos = 0;
-    for (i = 0; i < 4; i++) {
-        UBYTE v = bytes[i];
-        if (v >= 100) { p[pos++] = (BYTE)('0' + v / 100); v %= 100;
-                        p[pos++] = (BYTE)('0' + v /  10); v %= 10; }
-        else if (v >= 10) { p[pos++] = (BYTE)('0' + v / 10); v %= 10; }
-        p[pos++] = (BYTE)('0' + v);
-        if (i < 3) p[pos++] = '.';
-    }
-    p[pos] = 0;
-    return (STRPTR)p;
-}
-
-/* ---- inet_addr() --------------------------------------------------------- */
-
-ULONG bsd_inet_addr(STRPTR s __asm("a0"), struct BsdBase *base __asm("a6"))
-{
-    /* Parse dotted-decimal "a.b.c.d" locally — no A314 needed */
-    ULONG result = 0;
-    UBYTE parts  = 0;
-    ULONG cur    = 0;
-    UBYTE c;
-    (void)base;
-
-    if (!s) return 0xFFFFFFFFUL;
-
-    while ((c = (UBYTE)*s++) != 0) {
-        if (c >= '0' && c <= '9') {
-            cur = cur * 10 + (c - '0');
-            if (cur > 255) return 0xFFFFFFFFUL;
-        } else if (c == '.') {
-            result = (result << 8) | (cur & 0xFF);
-            cur = 0;
-            parts++;
-            if (parts > 3) return 0xFFFFFFFFUL;
-        } else {
-            return 0xFFFFFFFFUL;
-        }
-    }
-    result = (result << 8) | (cur & 0xFF);
-    parts++;
-    if (parts != 4) return 0xFFFFFFFFUL;
-    return result;
-}
-
-/* ---- inet_lnaof / inet_netof / inet_makeaddr / inet_network -------------- */
-
 ULONG bsd_inet_lnaof(ULONG in __asm("d0"), struct BsdBase *base __asm("a6"))
-{
-    (void)base;
-    if ((in & 0x80000000UL) == 0)          return in & 0x00FFFFFFUL; /* class A */
-    if ((in & 0xC0000000UL) == 0x80000000UL) return in & 0x0000FFFFUL; /* class B */
-    return in & 0x000000FFUL; /* class C */
-}
+{ (void)base; return in & 0xFF; }
 
 ULONG bsd_inet_netof(ULONG in __asm("d0"), struct BsdBase *base __asm("a6"))
-{
-    (void)base;
-    if ((in & 0x80000000UL) == 0)          return (in >> 24) & 0xFF;       /* class A */
-    if ((in & 0xC0000000UL) == 0x80000000UL) return (in >> 16) & 0xFFFF;   /* class B */
-    return (in >> 8) & 0xFFFFFFUL; /* class C */
-}
+{ (void)base; return in >> 8; }
 
 ULONG bsd_inet_makeaddr(ULONG net __asm("d0"), ULONG host __asm("d1"),
                         struct BsdBase *base __asm("a6"))
-{
-    (void)base;
-    if (net < 128UL)    return (net << 24) | (host & 0x00FFFFFFUL);
-    if (net < 65536UL)  return (net << 16) | (host & 0x0000FFFFUL);
-    return (net <<  8) | (host & 0x000000FFUL);
-}
+{ (void)base; return (net << 8) | (host & 0xFF); }
 
 ULONG bsd_inet_network(STRPTR s __asm("a0"), struct BsdBase *base __asm("a6"))
-{
-    /* Parse network number — simplified: same as inet_addr but may omit trailing octets */
-    return bsd_inet_addr(s, base);
-}
-
-/* ---- gethostbyname() ----------------------------------------------------- */
-
-struct hostent *bsd_gethostbyname(STRPTR name __asm("a0"),
-                                   struct BsdBase *base __asm("a6"))
-{
-    struct ExecBase   *SysBase = base->SysBase;
-    struct BsdSession *sess    = find_session(base);
-    struct BsdRspHdr  *rsp;
-    LONG   r;
-    UBYTE  namelen, i;
-    UBYTE *data;
-    (void)SysBase;
-
-    if (!sess || !name) return NULL;
-
-    namelen = 0;
-    while (name[namelen] && namelen < 254) namelen++;
-
-    /* args: namelen(1) name[namelen] */
-    fill_hdr(sess, BSDOP_GETHOSTBYNAME, 1 + namelen);
-    sess->io_buf[4] = namelen;
-    for (i = 0; i < namelen; i++) sess->io_buf[5 + i] = (UBYTE)name[i];
-
-    r = do_rpc(sess, base->SysBase, 5 + namelen);
-    if (r <= 0) return NULL; /* error or no addresses */
-
-    /* data = naddrs * 4 bytes (IPv4 in network byte order) */
-    rsp  = (struct BsdRspHdr *)sess->io_buf;
-    data = sess->io_buf + BSD_RSP_HDR_SIZE;
-    if (rsp->datalen < 4) return NULL;
-
-    /* Store first address as a ULONG in network byte order */
-    sess->haddr = ((ULONG)data[0] << 24) | ((ULONG)data[1] << 16) |
-                  ((ULONG)data[2] <<  8) |  (ULONG)data[3];
-
-    /* h_name = the queried name */
-    for (i = 0; i < namelen; i++) sess->hname[i] = name[i];
-    sess->hname[namelen] = 0;
-
-    return &sess->hent;
-}
-
-/* ---- gethostbyaddr() ----------------------------------------------------- */
+{ return bsd_inet_addr(s, base); }
 
 struct hostent *bsd_gethostbyaddr(APTR addr __asm("a0"), LONG len __asm("d0"),
                                    LONG type __asm("d1"),
                                    struct BsdBase *base __asm("a6"))
 {
-    struct ExecBase   *SysBase = base->SysBase;
-    struct BsdSession *sess    = find_session(base);
-    struct BsdRspHdr  *rsp;
-    UBYTE  alen, i;
-    LONG   r;
-    UBYTE *data;
-    (void)SysBase;
-
+    struct BsdSession *sess = find_session(base);
+    UBYTE  i;
     if (!sess || !addr || len < 4) return NULL;
-    alen = (UBYTE)len;
-
-    /* args: addrlen(1) addr[] type(2) */
-    fill_hdr(sess, BSDOP_GETHOSTBYADDR, 1 + alen + 2);
-    sess->io_buf[4] = alen;
-    for (i = 0; i < alen; i++) sess->io_buf[5 + i] = ((UBYTE *)addr)[i];
-    w16(&sess->io_buf[5 + alen], (UWORD)type);
-
-    r = do_rpc(sess, base->SysBase, 4 + 1 + alen + 2);
-    if (r < 0) return NULL;
-
-    /* data = hostname bytes */
-    rsp  = (struct BsdRspHdr *)sess->io_buf;
-    data = sess->io_buf + BSD_RSP_HDR_SIZE;
-    for (i = 0; i < rsp->datalen && i < 255; i++) sess->hname[i] = (BYTE)data[i];
-    sess->hname[rsp->datalen < 255 ? rsp->datalen : 255] = 0;
-
-    /* Store the queried address */
-    if (alen >= 4)
+    sess->req.opcode = BSDOP_GETHOSTBYADDR;
+    sess->req.arglen = 1 + (UWORD)len + 2;
+    sess->req.args[0] = (UBYTE)len;
+    for (i = 0; i < (UBYTE)len; i++) sess->req.args[1 + i] = ((UBYTE *)addr)[i];
+    w16(&sess->req.args[1 + len], (UWORD)type);
+    sess->req.indata = NULL; sess->req.inlen = 0;
+    sess->req.outdata = sess->hname; sess->req.outmax = sizeof sess->hname - 1;
+    do_rpc(sess);
+    propagate_errno(sess);
+    if (sess->req.result < 0) return NULL;
+    /* sess->req.outlen is the actual hostname length written to sess->hname */
+    if (sess->req.outlen >= sizeof sess->hname)
+        sess->req.outlen = sizeof sess->hname - 1;
+    sess->hname[sess->req.outlen] = 0;
+    /* Cache the queried IP in the hostent. */
+    if (len >= 4)
         sess->haddr = ((ULONG)((UBYTE *)addr)[0] << 24) |
                       ((ULONG)((UBYTE *)addr)[1] << 16) |
                       ((ULONG)((UBYTE *)addr)[2] <<  8) |
                        (ULONG)((UBYTE *)addr)[3];
-
     return &sess->hent;
 }
-
-/* ---- getnetbyname / getnetbyaddr ----------------------------------------- */
 
 struct netent *bsd_getnetbyname(STRPTR a0 __asm("a0"), struct BsdBase *base __asm("a6"))
 { (void)a0; (void)base; return NULL; }
@@ -1223,102 +1237,21 @@ struct netent *bsd_getnetbyaddr(ULONG d0 __asm("d0"), LONG d1 __asm("d1"),
                                  struct BsdBase *base __asm("a6"))
 { (void)d0; (void)d1; (void)base; return NULL; }
 
-/* ---- getservbyname / getservbyport --------------------------------------- */
-
-struct servent *bsd_getservbyname(STRPTR name __asm("a0"), STRPTR proto __asm("a1"),
+struct servent *bsd_getservbyname(STRPTR a0 __asm("a0"), STRPTR a1 __asm("a1"),
                                    struct BsdBase *base __asm("a6"))
-{
-    struct BsdSession *sess = find_session(base);
-    struct BsdRspHdr  *rsp;
-    UBYTE  namelen, protolen, i;
-    LONG   r;
-    UBYTE *data;
+{ (void)a0; (void)a1; (void)base; return NULL; }
 
-    if (!sess || !name) return NULL;
-
-    namelen  = 0; while (name[namelen]  && namelen  < 63) namelen++;
-    protolen = 0;
-    if (proto) { while (proto[protolen] && protolen < 15) protolen++; }
-
-    /* args: namelen(1) name[] protolen(1) proto[] */
-    fill_hdr(sess, BSDOP_GETSERVBYNAME, 2 + namelen + protolen);
-    sess->io_buf[4] = namelen;
-    for (i = 0; i < namelen;  i++) sess->io_buf[5 + i]           = (UBYTE)name[i];
-    sess->io_buf[5 + namelen] = protolen;
-    for (i = 0; i < protolen; i++) sess->io_buf[6 + namelen + i] = (UBYTE)proto[i];
-
-    r = do_rpc(sess, base->SysBase, 6 + namelen + protolen);
-    if (r < 0) return NULL;
-
-    /* result = port (host order); data = proto name bytes (no NUL) */
-    rsp  = (struct BsdRspHdr *)sess->io_buf;
-    data = sess->io_buf + BSD_RSP_HDR_SIZE;
-
-    for (i = 0; i < namelen;          i++) sess->sent_name[i]  = name[i];
-    sess->sent_name[namelen] = 0;
-
-    for (i = 0; i < rsp->datalen && i < 15; i++) sess->sent_proto[i] = (BYTE)data[i];
-    sess->sent_proto[rsp->datalen < 15 ? rsp->datalen : 15] = 0;
-
-    sess->sent.s_port = (int)r;  /* big-endian result = network order on m68k */
-    return &sess->sent;
-}
-
-struct servent *bsd_getservbyport(LONG port __asm("d0"), STRPTR proto __asm("a0"),
+struct servent *bsd_getservbyport(LONG d0 __asm("d0"), STRPTR a0 __asm("a0"),
                                    struct BsdBase *base __asm("a6"))
-{
-    struct BsdSession *sess = find_session(base);
-    struct BsdRspHdr  *rsp;
-    UBYTE  protolen, i;
-    LONG   r;
-    UBYTE *data;
+{ (void)d0; (void)a0; (void)base; return NULL; }
 
-    if (!sess) return NULL;
-
-    protolen = 0;
-    if (proto) { while (proto[protolen] && protolen < 15) protolen++; }
-
-    /* args: port(2) protolen(1) proto[] */
-    fill_hdr(sess, BSDOP_GETSERVBYPORT, 3 + protolen);
-    w16(&sess->io_buf[4], (UWORD)port);
-    sess->io_buf[6] = protolen;
-    for (i = 0; i < protolen; i++) sess->io_buf[7 + i] = (UBYTE)proto[i];
-
-    r = do_rpc(sess, base->SysBase, 7 + protolen);
-    if (r < 0) return NULL;
-
-    /* result = port (host order); data = service name bytes (no NUL) */
-    rsp  = (struct BsdRspHdr *)sess->io_buf;
-    data = sess->io_buf + BSD_RSP_HDR_SIZE;
-
-    for (i = 0; i < rsp->datalen && i < 63; i++) sess->sent_name[i] = (BYTE)data[i];
-    sess->sent_name[rsp->datalen < 63 ? rsp->datalen : 63] = 0;
-
-    if (proto) {
-        for (i = 0; i < protolen; i++) sess->sent_proto[i] = proto[i];
-        sess->sent_proto[protolen] = 0;
-    } else {
-        sess->sent_proto[0] = 0;
-    }
-
-    sess->sent.s_port = (int)port;  /* caller passes network-order port; echo it back */
-    return &sess->sent;
-}
-
-/* ---- getprotobyname / getprotobynumber ----------------------------------- */
-/*
- * Protocol numbers are IANA-standardised and never change, so we resolve
- * them locally without a Pi round-trip.
- */
-
+/* IANA-standardised protocol numbers — these don't change, so we serve
+ * them locally without a Pi round-trip.  ping needs "icmp" (=1) to even
+ * start. */
 static const struct { const char *name; int proto; } _proto_table[] = {
-    { "ip",      0   },
-    { "icmp",    1   },
-    { "igmp",    2   },
-    { "tcp",     6   },
-    { "udp",     17  },
-    { "raw",     255 },
-    { NULL,      0   }
+    { "ip",    0   }, { "icmp",  1   }, { "igmp",  2   },
+    { "tcp",   6   }, { "udp",   17  }, { "raw",   255 },
+    { NULL,    0   }
 };
 
 static struct protoent *_fill_pent(struct BsdSession *sess,
@@ -1326,54 +1259,48 @@ static struct protoent *_fill_pent(struct BsdSession *sess,
 {
     UBYTE i;
     for (i = 0; name[i] && i < 15; i++) sess->pent_name[i] = name[i];
-    sess->pent_name[i]  = 0;
-    sess->pent.p_proto  = proto;
+    sess->pent_name[i] = 0;
+    sess->pent.p_proto = proto;
     return &sess->pent;
 }
 
-struct protoent *bsd_getprotobyname(STRPTR name __asm("a0"),
+struct protoent *bsd_getprotobyname(STRPTR a0 __asm("a0"),
                                      struct BsdBase *base __asm("a6"))
 {
     struct BsdSession *sess = find_session(base);
-    UWORD i;
-    if (!sess || !name) return NULL;
+    UWORD i, j;
+    if (!sess || !a0) return NULL;
     for (i = 0; _proto_table[i].name; i++) {
         const char *p = _proto_table[i].name;
-        const char *n = (const char *)name;
-        UWORD j = 0;
-        while (p[j] && n[j] && p[j] == n[j]) j++;
-        if (!p[j] && !n[j])
+        const char *q = (const char *)a0;
+        j = 0;
+        while (p[j] && q[j] && p[j] == q[j]) j++;
+        if (!p[j] && !q[j])
             return _fill_pent(sess, _proto_table[i].name, _proto_table[i].proto);
     }
     return NULL;
 }
 
-struct protoent *bsd_getprotobynumber(LONG proto __asm("d0"),
+struct protoent *bsd_getprotobynumber(LONG d0 __asm("d0"),
                                        struct BsdBase *base __asm("a6"))
 {
     struct BsdSession *sess = find_session(base);
     UWORD i;
     if (!sess) return NULL;
     for (i = 0; _proto_table[i].name; i++) {
-        if (_proto_table[i].proto == (int)proto)
+        if (_proto_table[i].proto == (int)d0)
             return _fill_pent(sess, _proto_table[i].name, _proto_table[i].proto);
     }
     return NULL;
 }
 
-/* ---- vsyslog() ----------------------------------------------------------- */
-
 void bsd_vsyslog(LONG d0 __asm("d0"), STRPTR a0 __asm("a0"), APTR a1 __asm("a1"),
                  struct BsdBase *base __asm("a6"))
 { (void)d0; (void)a0; (void)a1; (void)base; }
 
-/* ---- dup2socket() -------------------------------------------------------- */
-
 LONG bsd_dup2socket(LONG d0 __asm("d0"), LONG d1 __asm("d1"),
                     struct BsdBase *base __asm("a6"))
 { (void)d0; (void)d1; (void)base; return -1; }
-
-/* ---- sendmsg / recvmsg --------------------------------------------------- */
 
 LONG bsd_sendmsg(LONG d0 __asm("d0"), APTR a0 __asm("a0"), LONG d1 __asm("d1"),
                  struct BsdBase *base __asm("a6"))
@@ -1383,209 +1310,12 @@ LONG bsd_recvmsg(LONG d0 __asm("d0"), APTR a0 __asm("a0"), LONG d1 __asm("d1"),
                  struct BsdBase *base __asm("a6"))
 { (void)d0; (void)a0; (void)d1; (void)base; return -1; }
 
-/* ---- gethostname() ------------------------------------------------------- */
-
 LONG bsd_gethostname(APTR buf __asm("a0"), LONG buflen __asm("d0"),
                      struct BsdBase *base __asm("a6"))
-{
-    struct ExecBase   *SysBase = base->SysBase;
-    struct BsdSession *sess    = find_session(base);
-    struct BsdRspHdr  *rsp;
-    LONG   r;
-    UBYTE *data, *dst;
-    UWORD  n, i;
-    (void)SysBase;
-
-    if (!sess || !buf || buflen <= 0) return -1;
-
-    fill_hdr(sess, BSDOP_GETHOSTNAME, 2);
-    w16(&sess->io_buf[4], (UWORD)buflen);
-    r = do_rpc(sess, base->SysBase, 6);
-    if (r < 0) return -1;
-
-    rsp  = (struct BsdRspHdr *)sess->io_buf;
-    data = sess->io_buf + BSD_RSP_HDR_SIZE;
-    n    = rsp->datalen;
-    if (n >= (UWORD)buflen) n = (UWORD)buflen - 1;
-
-    dst = (UBYTE *)buf;
-    for (i = 0; i < n; i++) dst[i] = data[i];
-    dst[n] = 0;
-    return 0;
-}
-
-/* ---- gethostid() --------------------------------------------------------- */
+{ (void)buf; (void)buflen; (void)base; return -1; }
 
 ULONG bsd_gethostid(struct BsdBase *base __asm("a6"))
 { (void)base; return 0; }
-
-/* ---- timer.device base for GetSysTime ------------------------------------- */
-
-/*
- * GetSysTime is NOT in exec.library.  It lives in timer.device at LVO -66
- * (_LVOGetSysTime EQU -66, TimerBase = the device pointer from a timerequest).
- *
- * We open timer.device once via the proper OpenDevice API (which is what every
- * real AmigaOS library does) and cache the base pointer.  The previous
- * FindName() shortcut could silently return NULL if the device list was not
- * yet fully initialised or if it found the wrong node — OpenDevice() is
- * guaranteed to succeed once the device is loaded and correctly sets
- * ior->io_Device to the timer base.
- *
- * We keep the device open for the library's lifetime (which is forever on
- * AmigaOS — our Expunge never fires) so the reference count stays > 0.
- * Calling GetSysTime without re-opening would also be fine (it reads hardware),
- * but keeping it open is cleaner.
- *
- * NOTE: GetSysTime (LVO -66) fills both tv_secs and tv_micro regardless of
- * which UNIT the device was opened with; UNIT_VBLANK (=1) is safe everywhere.
- */
-static struct Library    *s_TimerBase = NULL;
-static struct MsgPort    *s_TimerPort = NULL;
-static struct timerequest s_TimerReq;   /* full 40-byte struct; timer.device may write tr_time */
-
-/* Monotonic state for bsd_gettimeofday_fn — ensures elapsed > 0 always */
-static ULONG s_mono_sec  = 0;
-static ULONG s_mono_usec = 0;
-
-static void find_timer_base(struct ExecBase *SysBase)
-{
-    if (s_TimerBase) return;
-
-    /* --- Try OpenDevice first (definitive open, avoids FindName race) --- */
-    s_TimerPort = CreateMsgPort();
-    if (s_TimerPort) {
-        s_TimerReq.tr_node.io_Message.mn_ReplyPort = s_TimerPort;
-        s_TimerReq.tr_node.io_Message.mn_Length    = sizeof(s_TimerReq);
-
-        /* UNIT_VBLANK = 1 — works on all Kickstart versions */
-        if (OpenDevice((STRPTR)"timer.device", 1UL,
-                       (struct IORequest *)&s_TimerReq, 0) == 0) {
-            s_TimerBase = (struct Library *)s_TimerReq.tr_node.io_Device;
-            return;                  /* success */
-        }
-        DeleteMsgPort(s_TimerPort);
-        s_TimerPort = NULL;
-    }
-
-    /* --- Fallback: peek device node under Forbid (no allocation needed) --- */
-    Forbid();
-    s_TimerBase = (struct Library *)FindName(&SysBase->DeviceList, "timer.device");
-    Permit();
-}
-
-/* ---- gettimeofday shim handed to apps via SBTC_GETTIMEOFDAY -------------- */
-
-/*
- * Called directly by application code through a function pointer.
- * Uses timer.device GetSysTime (LVO -66) when available, otherwise uses a
- * monotonic counter.  ALWAYS returns 0 and fills *tv with a strictly
- * increasing time value — elapsed is NEVER zero between two calls.
- *
- * Why the monotonic guarantee matters:
- *   wget/AmispeedTest call gettimeofday around DNS lookup, connect, and each
- *   progress update.  If two consecutive calls return the same value (because
- *   both happened within one VBL tick ≈ 20 ms, or because timer.device failed
- *   to open), elapsed = 0, and wget computes speed = bytes / 0.  On AmigaOS
- *   without FPU, software-float division by zero corrupts the AmigaOS math
- *   library's global exception state.  ALL subsequent float operations then
- *   produce garbage, including the file-size display "(278K)" → "(23:K)" and
- *   the internal percentage variable that triggers assert(percentage <= 100).
- *
- * NOTE: GetSysTime is in timer.device, NOT exec.library.  The two LVOs are
- * completely different functions — calling exec at -192 writes garbage into
- * the timeval and produces garbled speed display.
- */
-static LONG bsd_gettimeofday_fn(struct timeval *tv, APTR tz)
-{
-    ULONG sec, usec;
-    (void)tz;
-    if (!tv) return -1;
-
-    if (s_TimerBase) {
-        /* GetSysTime fills tv in-place; a0 = tv pointer */
-        register struct Library *_tb __asm("a6") = s_TimerBase;
-        register struct timeval *_a0 __asm("a0") = tv;
-        __asm volatile("jsr -66(%%a6)"    /* _LVOGetSysTime, timer.device */
-                       : "+r"(_a0)
-                       : "r"(_tb)
-                       : "d0", "d1", "a1", "cc", "memory");
-        sec  = (ULONG)tv->tv_sec;
-        usec = (ULONG)tv->tv_usec;
-    } else {
-        /* timer.device unavailable — use monotonic counter as source */
-        sec  = s_mono_sec;
-        usec = s_mono_usec;
-    }
-
-    /* Guarantee strict monotonic increase: if same as or behind last call,
-     * advance by exactly 1 µs.  This prevents elapsed = 0 in the caller
-     * even when two calls land in the same timer tick or the clock is frozen. */
-    if (sec < s_mono_sec ||
-        (sec == s_mono_sec && usec <= s_mono_usec)) {
-        sec  = s_mono_sec;
-        usec = s_mono_usec + 1UL;
-        if (usec >= 1000000UL) { usec = 0UL; sec++; }
-    }
-    s_mono_sec  = sec;
-    s_mono_usec = usec;
-    tv->tv_sec  = (long)sec;
-    tv->tv_usec = (long)usec;
-    return 0;
-}
-
-/* ---- socketbasetaglist() ------------------------------------------------- */
-
-/*
- * Scans the caller's TagItem list and fulfils recognised tags:
- *
- *   SBTM_SETREF(SBTC_GETTIMEOFDAY)  0x80010010
- *       ti_Data = address of a function-pointer variable.
- *       We write &bsd_gettimeofday_fn there so the app can call it for
- *       high-resolution timing.  Without this, download speed displays
- *       garble (start-time remains zero / uninitialized).
- *
- *   SBTM_SETREF(SBTC_ERRNOLONGPTR)  0x80010006  (Miami fmt, SBTC_ERRNOLONGPTR=6)
- *   SBTM_SETREF(SBTC_ERRNO)         0x80010004  (Miami fmt, SBTC_ERRNO=4)
- *   SBTM_SETREF(SBTC_ERRNOLONGPTR)  0x80008031  (AmiTCP fmt, SBTC_ERRNOLONGPTR=24)
- *       ti_Data = address of a LONG errno cell.
- *       We store it in the session; do_rpc() writes errno there after every
- *       call so the app sees it without calling Errno().
- */
-LONG bsd_socketbasetaglist(APTR taglist __asm("a0"), struct BsdBase *base __asm("a6"))
-{
-    typedef LONG (*GtodFn)(struct timeval *, APTR);
-    struct BsdSession *sess = find_session(base);
-    ULONG *ti = (ULONG *)taglist;
-
-    if (!ti) return 0;
-
-    while (1) {
-        ULONG tag  = ti[0];
-        ULONG data = ti[1];
-        ti += 2;
-
-        if (tag == 0UL) break;                           /* TAG_DONE  */
-        if (tag == 1UL) continue;                        /* TAG_IGNORE */
-        if (tag == 2UL) { ti = (ULONG *)(APTR)data; continue; } /* TAG_MORE */
-        if (tag == 3UL) { ti += data * 2UL; continue; } /* TAG_SKIP  */
-
-        if (tag == 0x80010010UL && data) {               /* SBTC_GETTIMEOFDAY */
-            find_timer_base(base->SysBase);
-            /* Always install bsd_gettimeofday_fn regardless of whether
-             * timer.device opened.  The function uses a monotonic counter
-             * as fallback so elapsed is NEVER zero — preventing the
-             * soft-float division-by-zero that corrupts AmigaOS math state. */
-            *((GtodFn *)data) = bsd_gettimeofday_fn;
-        }
-        else if ((tag == 0x80010006UL || tag == 0x80010004UL ||
-                  tag == 0x80008031UL) && data && sess)
-            sess->errno_ptr = (LONG *)data;   /* SBTC_ERRNOLONGPTR/SBTC_ERRNO (Miami+AmiTCP) */
-    }
-    return 0;
-}
-
-/* ---- getsocketevents() --------------------------------------------------- */
 
 ULONG bsd_getsocketevents(APTR a0 __asm("a0"), struct BsdBase *base __asm("a6"))
 { (void)a0; (void)base; return 0; }

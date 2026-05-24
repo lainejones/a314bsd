@@ -7,6 +7,7 @@ CFLAGS = -m68000 -O2 -nostartfiles -nostdlib -fomit-frame-pointer \
 TARGET  = bsdsocket.library
 OBJS    = lib_start.o bsdsocket.o
 
+
 TESTCC  = m68k-amigaos-gcc
 TESTCFLAGS = -m68000 -O2 \
          -I../include \
