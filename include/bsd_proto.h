@@ -212,6 +212,42 @@ struct BsdResHdr {
  *
  * BSDOP_IOCTL          args: fd(2) request(4) arg(4)
  *                      result: 0 or value (e.g. FIONREAD returns bytes ready)
+ *
+ * BSDOP_SSL_CTX_NEW    args: (none)
+ *                      result: ctx_id (>= 1) or -1
+ *
+ * BSDOP_SSL_CTX_FREE   args: ctx_id(4)
+ *                      result: 0
+ *
+ * BSDOP_SSL_NEW        args: ctx_id(4)
+ *                      result: ssl_id (>= 1) or -1
+ *
+ * BSDOP_SSL_FREE       args: ssl_id(4)
+ *                      result: 0
+ *
+ * BSDOP_SSL_SET_FD     args: ssl_id(4) fd(4)
+ *                      result: 0 or -1
+ *
+ * BSDOP_SSL_SET_SNI    args: ssl_id(4) hostlen(1) hostname[hostlen]
+ *                      result: 0
+ *
+ * BSDOP_SSL_CONNECT    args: ssl_id(4)
+ *                      result: 0 (success) or -1  (BLOCKS during handshake)
+ *
+ * BSDOP_SSL_SHUTDOWN   args: ssl_id(4)
+ *                      result: 0 or -1
+ *
+ * BSDOP_SSL_READ       args: ssl_id(4) maxlen(4)
+ *                      result: bytes_read / 0 (EOF) / -1  (BLOCKS)
+ *                      out:    data[bytes_read]
+ *
+ * BSDOP_SSL_WRITE      args: ssl_id(4)
+ *                      inlen = len (plaintext bytes to encrypt and send)
+ *                      result: bytes_written or -1
+ *
+ * BSDOP_SSL_GET_ERROR  args: ssl_id(4) ret(4)
+ *                      result: SSL error code (0=NONE 6=ZERO_RETURN 5=SYSCALL)
+ *                      Note: implemented locally on the Amiga — no Pi round-trip.
  */
 
 #endif /* A314BSD_PROTO_H */

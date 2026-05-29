@@ -41,11 +41,13 @@
     .equ    bsdbase_SIZEOF,        60  | rounded up from 58
 
     | v4.366: extend table to match Roadshow's full LVO range.
-    | 4 std + 46 implemented + 87 stub = 137 entries, 137*6 = 822
-    | Stubs return 0 / NULL so wget's feature-probe paths see "function failed,
-    | fall back to legacy".  Without this any wget call past LVO -300 would
-    | JSR into junk memory and crash.
-    .equ    LIB_NEGSIZE_VAL,    822
+    | 4 std + 46 implemented + 85 stub + 2 getaddrinfo + 11 SSL = 148 entries,
+    | 148*6 = 888.  Stubs return 0 / NULL so wget's feature-probe paths see
+    | "function failed, fall back to legacy".  Without this any wget call past
+    | LVO -300 would JSR into junk memory and crash.  The SSL extension (LVO
+    | -828..-888) and the two getaddrinfo entries (-804/-810) are implemented in
+    | bsd_ssl_stubs.c; see ssl_proto.h / ssl_lvo.h.
+    .equ    LIB_NEGSIZE_VAL,    888
 
     | exec LVO offsets — confirmed from pragmas/exec_pragmas.h
     | #pragma syscall MakeLibrary 54 ...   → LVO -0x54 = -84
@@ -85,7 +87,7 @@ LibName:
 IDString:
     | NOTE: the AmigaDOS `version` command reads this string (not lib_Revision)
     | to report the version number, so the "4.NN" here MUST match REVISION above.
-    .ascii  "a314bsd bsdsocket.library 4.53 (23.05.2026)"
+    .ascii  "a314bsd bsdsocket.library 4.53 (29.05.2026)"
     .byte   13,10,0
     .even
 
@@ -232,10 +234,24 @@ FuncTable:
     .long   StubRetZero | -786
     .long   StubRetZero | -792
     .long   StubRetZero | -798
-    .long   StubRetZero | -804  freeaddrinfo
-    .long   StubRetZero | -810  getaddrinfo
+    .long   _bsd_freeaddrinfo | -804  freeaddrinfo  (SSL build: was StubRetZero)
+    .long   _bsd_getaddrinfo  | -810  getaddrinfo   (SSL build: was StubRetZero)
     .long   StubRetZero | -816  gai_strerror
     .long   StubRetZero | -822  getnameinfo
+
+    | --- SSL LVOs -828..-888 (11 entries; implemented in bsd_ssl_stubs.c) ---
+    .long   _bsd_ssl_ctx_new        | -828
+    .long   _bsd_ssl_ctx_free       | -834
+    .long   _bsd_ssl_new            | -840
+    .long   _bsd_ssl_free           | -846
+    .long   _bsd_ssl_set_fd         | -852
+    .long   _bsd_ssl_set_sni        | -858
+    .long   _bsd_ssl_connect        | -864
+    .long   _bsd_ssl_shutdown       | -870
+    .long   _bsd_ssl_read           | -876
+    .long   _bsd_ssl_write          | -882
+    .long   _bsd_ssl_get_error      | -888
+
     .long   -1
 
     | C symbols
@@ -288,6 +304,21 @@ FuncTable:
     .extern _bsd_gethostid
     .extern _bsd_socketbasetaglist
     .extern _bsd_getsocketevents
+
+    | getaddrinfo + SSL extension (implemented in bsd_ssl_stubs.c)
+    .extern _bsd_getaddrinfo
+    .extern _bsd_freeaddrinfo
+    .extern _bsd_ssl_ctx_new
+    .extern _bsd_ssl_ctx_free
+    .extern _bsd_ssl_new
+    .extern _bsd_ssl_free
+    .extern _bsd_ssl_set_fd
+    .extern _bsd_ssl_set_sni
+    .extern _bsd_ssl_connect
+    .extern _bsd_ssl_shutdown
+    .extern _bsd_ssl_read
+    .extern _bsd_ssl_write
+    .extern _bsd_ssl_get_error
 
 | ---- Init: called by exec InitResident with d0=segList, a6=ExecBase --------
 | Responsible for: MakeLibrary → fill fields → AddLibrary → return libbase.
