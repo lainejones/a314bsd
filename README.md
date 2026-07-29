@@ -4,7 +4,11 @@ Replaces `bsdsocket.library` on the Amiga with a proxy that forwards all
 AmiTCP-compatible BSD socket calls to a Python service on the Raspberry Pi.
 The Pi's TCP/IP stack does the actual networking; the Amiga 68000 does nothing.
 
-**Tested working:** AWeb / IBrowse (HTTP), smb2fs (SMB shares), test_bsd HTTP.
+**Tested working:** AWeb / IBrowse (HTTP), smb2fs (SMB shares), ping, test_bsd HTTP.
+
+> **HTTPS?** This base library is deliberately SSL-free. For HTTPS/TLS, add the
+> companion **[a314SSLlib](../a314SSLlib)** project — it layers AmiSSL-compatible
+> TLS on top of this base (TLS offloaded to the Pi), with no changes to a314bsd.
 
 ---
 
@@ -124,7 +128,7 @@ at 242 bytes. The caller loops for larger transfers.
 | `sendmsg` / `recvmsg` | Returns `EOPNOTSUPP` |
 | `getservbyname` / `getservbyport` | ✅ Implemented |
 | `SocketBaseTagList` ERRNOPTR tag | Ignored (use `Errno()`) |
-| HTTPS / TLS | Works if the Amiga has a TLS-capable browser (IBrowse 2.4+); **requires correct system clock** — SSL certificates are date-validated and will fail if the Amiga RTC is wrong |
+| HTTPS / TLS | Not in base — add the companion **[a314SSLlib](../a314SSLlib)** project (Pi-side TLS offload; Amiga clock need not be correct — the Pi verifies certs) |
 
 ---
 

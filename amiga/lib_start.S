@@ -456,3 +456,27 @@ ___umodsi3:
     move.l  d2,d0               | return remainder in d0
     movem.l (sp)+,d2/d3
     rts
+
+| ---- memcpy ----------------------------------------------------------------
+| void *memcpy(void *dest, const void *src, size_t n)
+|
+| GCC -O2 emits a memcpy call for aggregate (struct/array) copies in
+| bsdsocket.c (e.g. bsd_getsockopt, sockname_rpc).  As with __udivsi3 above,
+| the -nostdlib cross toolchain provides no memcpy, so we supply one.
+|
+| m68k-amigaos C ABI (stack args): [sp+4]=dest [sp+8]=src [sp+12]=n.
+| Returns dest in d0.  Touches only d0/d1/a0/a1 (scratch) — preserves d2-d7/a2-a6.
+    .globl  _memcpy
+_memcpy:
+    move.l  4(sp),a0            | a0 = dest (also the return value)
+    move.l  8(sp),a1            | a1 = src
+    move.l  12(sp),d1           | d1 = byte count
+    move.l  a0,d0               | d0 = return value = dest
+    tst.l   d1
+    beq.s   mcpy_done
+mcpy_loop:
+    move.b  (a1)+,(a0)+
+    subq.l  #1,d1
+    bne.s   mcpy_loop
+mcpy_done:
+    rts

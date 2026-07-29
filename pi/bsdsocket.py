@@ -161,6 +161,9 @@ _LINUX_TO_BSD_ERRNO = {
     110: 60,   # ETIMEDOUT
     111: 61,   # ECONNREFUSED
     113: 65,   # EHOSTUNREACH
+    114: 37,   # EALREADY
+    115: 36,   # EINPROGRESS (non-blocking connect; raw 115 confused
+               # select-driven clients — ported from fix branch)
 }
 
 def to_bsd_errno(linux_err):
@@ -177,8 +180,7 @@ class Session:
     def __init__(self, service, stream_id):
         self.service = service
         self.stream_id = stream_id
-        self.sockets = {}             # fd -> socket.socket
-        self.next_fd = 3              # 0/1/2 reserved
+        self.sockets = {}             # fd -> socket.socket (0/1/2 reserved)
         self.rx_buffer = bytearray()  # bytes received from a314d, not yet parsed
         # SOCK_RAW or SOCK_DGRAM+ICMP fds — recvfrom uses 1-sec timeout
         # (returns EINTR on timeout so ping can send next echo)
@@ -191,8 +193,15 @@ class Session:
     # ---- socket table ----
 
     def alloc_fd(self, sock):
-        fd = self.next_fd
-        self.next_fd += 1
+        # Reuse the LOWEST free fd (>= 3).  fds must stay < 32 because the
+        # Amiga side carries fd_sets as 32-bit masks in WAITSELECT — the old
+        # monotonic counter sailed past fd 31 after ~29 sockets in one
+        # session, after which WaitSelect silently dropped those fds and
+        # long browser sessions degraded/hung (fix ported from
+        # fix/rpc-ret-and-fd-overflow, adapted to v5).
+        fd = 3
+        while fd in self.sockets:
+            fd += 1
         self.sockets[fd] = sock
         return fd
 

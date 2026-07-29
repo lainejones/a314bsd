@@ -31,5 +31,9 @@ test_bsd: test_bsd.c
 bsdnet: bsdnet.c
 	$(TESTCC) $(TESTCFLAGS) -o $@ $<
 
+# fd-allocation churn regression test (fd_set overflow fix)
+fdchurn: fdchurn.c
+	$(TESTCC) $(TESTCFLAGS) -o $@ $<
+
 clean:
-	rm -f $(OBJS) $(TARGET) test_bsd bsdnet
+	rm -f $(OBJS) $(TARGET) test_bsd bsdnet fdchurn
