@@ -1,0 +1,5 @@
+# Sources + scripts build/run under WSL and on the Pi — keep LF endings.
+* text=auto eol=lf
+
+# Amiga icon files are binary — never touch their bytes.
+*.info binary

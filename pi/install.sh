@@ -72,23 +72,46 @@ echo ""
 # 2. Install service script
 # --------------------------------------------------------------------------
 
-echo "[1/3] Installing bsdsocket.py -> $A314_DIR/bsdsocket.py"
+echo "[1/3] Installing bsdsocket.py + bsdctl.py -> $A314_DIR/"
 cp "$SCRIPT_DIR/bsdsocket.py" "$A314_DIR/bsdsocket.py"
 chmod 644 "$A314_DIR/bsdsocket.py"
+if [ -f "$SCRIPT_DIR/bsdctl.py" ]; then
+    cp "$SCRIPT_DIR/bsdctl.py" "$A314_DIR/bsdctl.py"
+    chmod 644 "$A314_DIR/bsdctl.py"
+    echo "      bsdctl.py installed (network control backend for bsdnet + NetBridge)"
+fi
+
+# bsdctl toggles a 'bsdsocket.paused' flag file in $A314_DIR.  a314d commonly
+# runs as a NON-root user, but $A314_DIR is root-owned — so that user can't
+# create the flag (network on/off silently no-ops).  Grant the a314d service
+# group write access to the directory so the flag can be created/removed.
+SVC_USER="$(systemctl show a314d -p User --value 2>/dev/null || true)"
+SVC_GROUP="$(systemctl show a314d -p Group --value 2>/dev/null || true)"
+[ -z "$SVC_GROUP" ] && SVC_GROUP="$SVC_USER"
+if [ -n "$SVC_USER" ] && [ "$SVC_USER" != "root" ]; then
+    [ -n "$SVC_GROUP" ] && chgrp "$SVC_GROUP" "$A314_DIR" 2>/dev/null || true
+    chmod g+w "$A314_DIR"
+    echo "      granted '$SVC_GROUP' write on $A314_DIR (for the bsdctl pause flag)"
+fi
 
 # --------------------------------------------------------------------------
-# 3. Register service in a314d.conf
+# 3. Register services in a314d.conf
 # --------------------------------------------------------------------------
 
 echo "[2/3] Updating $CONF_FILE"
-if grep -q "^bsdsocket" "$CONF_FILE"; then
-    echo "      'bsdsocket' entry already present — skipping (not modified)"
-else
-    # Backup, then append the new service line
-    cp "$CONF_FILE" "${CONF_FILE}.bak"
-    printf 'bsdsocket\t%s\t%s\n' "$PYTHON" "$A314_DIR/bsdsocket.py" >> "$CONF_FILE"
-    echo "      Added entry (backup saved to ${CONF_FILE}.bak)"
-fi
+CONF_BACKED_UP=""
+add_service() {   # name  script
+    if grep -q "^$1" "$CONF_FILE"; then
+        echo "      '$1' entry already present — skipping"
+    else
+        [ -z "$CONF_BACKED_UP" ] && { cp "$CONF_FILE" "${CONF_FILE}.bak"; CONF_BACKED_UP=1; }
+        printf '%s\t%s\t%s\n' "$1" "$PYTHON" "$A314_DIR/$2" >> "$CONF_FILE"
+        echo "      Added '$1' entry"
+    fi
+}
+add_service bsdsocket bsdsocket.py
+[ -f "$SCRIPT_DIR/bsdctl.py" ] && add_service bsdctl bsdctl.py
+[ -n "$CONF_BACKED_UP" ] && echo "      (backup saved to ${CONF_FILE}.bak)"
 
 # --------------------------------------------------------------------------
 # 4. Restart a314d so it picks up the new config

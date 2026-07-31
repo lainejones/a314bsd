@@ -59,7 +59,18 @@ Any software that calls `OpenLibrary("bsdsocket.library", 4)` will work:
 - **SMB shares**: `smb2fs mount smb://user:pass@server/share mountpoint:`
 - **FTP clients**: any AmiTCP-compatible FTP client
 - **Custom tools**: `test_bsd example.com 80 /` (included smoke test)
-- **bsdnet**: `bsdnet status` / `bsdnet stop` / `bsdnet start`
+
+### Network control (NetBridge)
+
+Pause/resume the proxy without unloading anything (backed by the `bsdctl`
+service, `pi/bsdctl.py`). While paused, **new** connections are refused with
+`ENETDOWN`; connections already open keep working.
+
+- **CLI**: `bsdnet stop` (offline) / `bsdnet start` (online) / `bsdnet status`
+- **GUI**: `NetBridge` — a small GadTools control panel with a live status
+  line, **Disconnect / Connect / Refresh**, a **Host** field, and **Ping** /
+  **Net Status** (results shown in a requester). Talks the `bsdctl` service
+  directly, so it works even when `bsdsocket.library` is paused.
 
 ---
 

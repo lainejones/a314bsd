@@ -35,5 +35,9 @@ bsdnet: bsdnet.c
 fdchurn: fdchurn.c
 	$(TESTCC) $(TESTCFLAGS) -o $@ $<
 
+# NetBridge — GadTools network control panel (front-end for the bsdctl service)
+netbridge: netbridge.c
+	$(TESTCC) $(TESTCFLAGS) -o $@ $<
+
 clean:
-	rm -f $(OBJS) $(TARGET) test_bsd bsdnet fdchurn
+	rm -f $(OBJS) $(TARGET) test_bsd bsdnet fdchurn bsdnetgui netbridge

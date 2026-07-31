@@ -32,10 +32,20 @@ To make recv block correctly:
 import asyncio
 import errno as _errno
 import logging
+import os
 import socket
 import struct
 import sys
 from typing import Optional, Tuple
+
+# Network on/off flag, toggled by bsdctl.py (bsdnet stop/start, or the GUI).
+# When present, new connect() calls are refused with ENETDOWN.  Same path as
+# bsdctl.py (both scripts live in /opt/a314).
+_PAUSE_FLAG = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           'bsdsocket.paused')
+
+def _network_paused():
+    return os.path.exists(_PAUSE_FLAG)
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -287,6 +297,11 @@ def dispatch_op(sess: Session, opcode: int, args: bytes, indata: bytes) -> Tuple
             return (0, 0, b'')
 
         elif opcode == BSDOP_CONNECT:
+            # Network on/off: if paused via bsdctl (bsdnet stop / the GUI),
+            # refuse new connections with ENETDOWN.  Existing sockets are
+            # untouched, so open connections keep working.
+            if _network_paused():
+                return (-1, 50, b'')   # ENETDOWN (AmiTCP)
             (fd, alen) = struct.unpack_from('>HB', args)
             addr_bytes = args[3:3+alen]
             (_fam, port) = struct.unpack_from('>HH', addr_bytes)

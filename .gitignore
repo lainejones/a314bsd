@@ -6,4 +6,5 @@ amiga/bsdsocket.S
 amiga/test_bsd
 amiga/bsdnet
 amiga/fdchurn
+amiga/netbridge
 pi/__pycache__/

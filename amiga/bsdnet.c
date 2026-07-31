@@ -99,8 +99,14 @@ int main(int argc, char **argv)
         rc = 20; goto cleanup_ior;
     }
 
-    /* Connect to bsdctl service */
-    ior->a314_Socket  = (ULONG)FindTask(NULL);
+    /* Connect to bsdctl service.  a314.device rejects a socket ID it just
+     * closed, so use a monotonic ID rather than a fixed FindTask value
+     * (matters when the tool is run repeatedly in quick succession). */
+    {
+        static ULONG s_sockid = 0;
+        if (s_sockid == 0) s_sockid = (ULONG)FindTask(NULL);
+        ior->a314_Socket  = s_sockid++;
+    }
     ior->a314_Buffer  = (STRPTR)"bsdctl";
     ior->a314_Length  = 6;
     ior->a314_Request.io_Command = A314_CONNECT;
