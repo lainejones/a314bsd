@@ -32,22 +32,29 @@ sudo ./install.sh
 ```
 
 The script:
-1. Copies `bsdsocket.py` to `/opt/a314/`
-2. Adds `bsdsocket` to `a314d.conf`
-3. Restarts `a314d`
+1. Copies `bsdsocket.py` and `bsdctl.py` to `/opt/a314/`
+2. Adds `bsdsocket` and `bsdctl` to `a314d.conf`
+3. Grants the `a314d` service user write access to the flag directory
+   (so NetBridge's network on/off can create its pause flag)
+4. Restarts `a314d`
 
-After this, the service launches automatically whenever the Amiga opens
-`bsdsocket.library`. No manual startup is needed after reboots.
+After this, the services launch automatically whenever the Amiga opens
+`bsdsocket.library` or the `bsdctl` service. No manual startup is needed
+after reboots.
 
 ### Amiga (one time)
 
-Copy the compiled library to the Amiga:
+Copy the compiled files to the Amiga:
 
 ```
 bsdsocket.library  ->  LIBS:
+NetBridge          ->  anywhere (has an icon) — network control panel
+bsdnet             ->  C: (or anywhere on your path) — CLI equivalent
 ```
 
-That is all. No `Startup-Sequence` changes are needed.
+Only `bsdsocket.library` is required; `NetBridge` and `bsdnet` are optional
+tools for pausing/resuming the proxy and pinging. No `Startup-Sequence`
+changes are needed.
 
 ---
 
@@ -149,6 +156,7 @@ at 242 bytes. The caller loops for larger transfers.
 amiga/
   lib_start.S      ROM tag, LVO jump table (50 entries)
   bsdsocket.c      C implementation of all socket calls
+  netbridge.c      NetBridge — GadTools network control panel
   bsdnet.c         CLI control tool (bsdnet start|stop|status)
   test_bsd.c       Smoke-test HTTP client
   Makefile
@@ -160,5 +168,6 @@ include/
 
 pi/
   bsdsocket.py     Pi asyncio service
+  bsdctl.py        Network-control backend (pause/resume, ping, status)
   install.sh       One-shot installer for the Pi
 ```

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-bsdsocket.py - a314bsd Pi service  (v4.52 / arch v5)
+bsdsocket.py - a314bsd Pi service  (v4.54 / arch v5)
 
 Architecture v5 differs from v4: each Amiga library call results in ONE
 Linux syscall on the Pi side (no per-chunk request loop).  Data streams back
@@ -587,9 +587,9 @@ class A314Service:
             self.reader, self.writer = await asyncio.open_connection(A314D_HOST, A314D_PORT)
         if self.do_register:
             await self._register()
-            log.warning('a314bsd v4.53 ready (standalone) on service %s', SERVICE_NAME.decode())
+            log.warning('a314bsd v4.54 ready (standalone) on service %s', SERVICE_NAME.decode())
         else:
-            log.warning('a314bsd v4.53 ready (on-demand) on service %s', SERVICE_NAME.decode())
+            log.warning('a314bsd v4.54 ready (on-demand) on service %s', SERVICE_NAME.decode())
         await self._read_loop()
 
     async def _register(self):

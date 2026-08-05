@@ -12,7 +12,7 @@
     | stays at 4 to preserve OpenLibrary compatibility for apps that asked
     | for V4 against the old codebase.  REVISION jumps to 50 to clearly
     | differentiate from the previous v4.42.
-    .equ    REVISION,       53
+    .equ    REVISION,       54
 
     | exec/nodes.h
     .equ    LN_TYPE,        8
@@ -85,7 +85,7 @@ LibName:
 IDString:
     | NOTE: the AmigaDOS `version` command reads this string (not lib_Revision)
     | to report the version number, so the "4.NN" here MUST match REVISION above.
-    .ascii  "a314bsd bsdsocket.library 4.53 (23.05.2026)"
+    .ascii  "a314bsd bsdsocket.library 4.54 (04.08.2026)"
     .byte   13,10,0
     .even
 

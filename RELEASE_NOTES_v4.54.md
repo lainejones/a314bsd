@@ -1,4 +1,4 @@
-# a314bsd v4.53 — NetBridge network control
+# a314bsd v4.54 — NetBridge network control
 
 a314bsd replaces **bsdsocket.library** on the Amiga with a proxy that forwards
 all AmiTCP-compatible BSD socket calls over the A314 link to a Python service on
