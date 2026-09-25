@@ -126,15 +126,42 @@ Defined in `include/bsd_proto.h`.
 
 | Direction | Layout |
 |-----------|--------|
-| Request (Amiga → Pi) | `opcode(1)` `seq(1)` `arglen(2)` `args[arglen]` |
-| Response (Pi → Amiga) | `seq(1)` `result(4)` `datalen(2)` `data[datalen]` |
+| Request (Amiga → Pi) | `opcode(1)` `seq(1)` `arglen(2)` `inlen(2)` `args[arglen]`, then `inlen` bytes in raw ≤252-byte chunks |
+| Response (Pi → Amiga) | `seq(1)` `result(4)` `errno(4)` `outlen(2)`, then `outlen` bytes in raw ≤252-byte chunks |
 
 `result >= 0`: success / return value  
-`result < 0`: `-errno` (BSD/AmiTCP errno values)
+`result < 0`: failure, `errno` holds the BSD/AmiTCP errno value
 
-**Hard limit**: the A314 ring buffer is 256 bytes per direction; each message
-payload must be ≤ 252 bytes. `recv` is capped at 245 bytes per call; `send`
-at 242 bytes. The caller loops for larger transfers.
+**Hard limit**: the A314 ring buffer is 256 bytes per direction; each packet
+payload must be ≤ 252 bytes, so data is streamed as raw chunks after the
+header. `inlen`/`outlen` are 16-bit: `send()`/`SSL_write` move at most 32 KB
+per call (`send` returns the short count, `SSL_write` loops internally),
+`sendto()` at most 65535 bytes, and the Pi returns at most 32 KB per `recv`.
+
+### Wire protocol v6 (library 4.55, 2026-09-25)
+
+Adds two opcodes so `WaitSelect()` honours its signal mask (e.g. Ctrl-C)
+even with no timeout:
+
+- `BSDOP_PROTOVER` (25): the Pi answers with its protocol version (6).
+  The library probes once per session, the first time `WaitSelect()` is
+  called with a non-empty signal mask.
+- `BSDOP_CANCEL` (26): a bare request header, **never answered**. While a
+  `WAITSELECT` is blocked on the Pi, the caller `Wait()`s on the reply *and*
+  its signal mask; on a signal the dispatcher sends `CANCEL`, the Pi wakes
+  its `select()` through a per-session self-pipe and answers the
+  `WAITSELECT` normally, and `WaitSelect()` returns with the received
+  signals in `*sigmask`. A `CANCEL` that arrives after the select finished
+  is silently dropped, so there is always exactly one response.
+
+Backward compatible both ways: a v5 Pi service answers `PROTOVER` with
+`-1`/`EINVAL`, and the library then never sends `CANCEL` (signals are only
+checked after the select returns, as before); a v5 library never sends
+either opcode. Update both sides to get the interruptible `WaitSelect()`.
+
+The same release also byte-swaps integer socket options (`SO_RCVBUF`,
+`SO_LINGER`, `TCP_NODELAY`, ...) and the `FIONREAD` count on the
+little-endian Pi, which were previously returned in the wrong byte order.
 
 ---
 

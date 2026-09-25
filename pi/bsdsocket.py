@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 """
-bsdsocket.py - a314bsd Pi service  (v4.54 / arch v5)
+bsdsocket.py - a314bsd Pi service  (v4.55 / arch v5, wire protocol v6)
+
+Protocol v6 (2026-09-25) adds BSDOP_PROTOVER and BSDOP_CANCEL so an Amiga
+WaitSelect() can be interrupted by its signal mask: the library sends a bare
+CANCEL header while a WAITSELECT is in flight, which wakes our select() via a
+per-session self-pipe.  CANCEL never gets a response.  v5 libraries never
+send either opcode, so they keep working unchanged.
 
 Architecture v5 differs from v4: each Amiga library call results in ONE
 Linux syscall on the Pi side (no per-chunk request loop).  Data streams back
@@ -114,6 +120,10 @@ BSDOP_GETSERVBYPORT = 21
 BSDOP_WAITSELECT    = 22
 BSDOP_GETHOSTNAME   = 23
 BSDOP_IOCTL         = 24
+BSDOP_PROTOVER      = 25   # v6: result = BSD_PROTO_VERSION
+BSDOP_CANCEL        = 26   # v6: wake an in-flight WAITSELECT; NO response
+
+BSD_PROTO_VERSION   = 6    # must match include/bsd_proto.h
 
 # ---------------------------------------------------------------------------
 # AmiTCP <-> Linux constant translation
@@ -135,6 +145,24 @@ def translate_sockopt(level, optname):
     if level == _AMIGA_SOL_SOCKET:
         return _LINUX_SOL_SOCKET, _AMIGA_TO_LINUX_SO.get(optname, optname)
     return level, optname
+
+# Option values made of 32-bit ints must be byte-swapped: the Amiga is
+# big-endian, the Pi little-endian.  All mapped SOL_SOCKET options are ints
+# (SO_LINGER = two ints) and every IPPROTO_TCP option is an int.  Other
+# levels (IP: addresses already in network order) pass through untouched.
+_AMIGA_IPPROTO_TCP = 6
+
+def _sockopt_is_int(level, optname):
+    if level == _AMIGA_SOL_SOCKET:
+        return optname in _AMIGA_TO_LINUX_SO
+    return level == _AMIGA_IPPROTO_TCP
+
+def _swap_ints(val, src, dst):
+    """Re-encode a buffer of 32-bit ints from byte order src to dst."""
+    n = len(val) // 4
+    if n == 0 or len(val) % 4:
+        return val
+    return struct.pack('%s%di' % (dst, n), *struct.unpack('%s%di' % (src, n), val))
 
 # AmiTCP MSG_* -> Linux MSG_* translation.
 # Low bits (OOB=1, PEEK=2, DONTROUTE=4, EOR=8, TRUNC=16, CTRUNC=32) match.
@@ -199,6 +227,33 @@ class Session:
         # (Linux strips the IP header from SOCK_DGRAM_ICMP receives; the
         # Amiga ping app expects to see the IP header it would get from RAW)
         self.dgram_icmp_fds = set()
+        # v6 WaitSelect cancel: a self-pipe whose read end is added to every
+        # WAITSELECT select(); BSDOP_CANCEL (or session teardown) writes a
+        # byte to wake it.  select_active is True while a WAITSELECT runs.
+        self.cancel_r, self.cancel_w = os.pipe()
+        os.set_blocking(self.cancel_r, False)
+        os.set_blocking(self.cancel_w, False)
+        self.select_active = False
+
+    # ---- WaitSelect cancel pipe ----
+
+    def signal_cancel(self):
+        try: os.write(self.cancel_w, b'x')
+        except OSError: pass     # pipe full (already signalled) or closed
+
+    def drain_cancel(self):
+        try:
+            while os.read(self.cancel_r, 64):
+                pass
+        except OSError:
+            pass                 # BlockingIOError = empty
+
+    def close_cancel_pipe(self):
+        for pfd in (self.cancel_r, self.cancel_w):
+            if pfd >= 0:
+                try: os.close(pfd)
+                except OSError: pass
+        self.cancel_r = self.cancel_w = -1
 
     # ---- socket table ----
 
@@ -224,6 +279,10 @@ class Session:
             except: pass
 
     def close_all(self):
+        # Wake a WAITSELECT still blocked in select() for this session (the
+        # pipe itself is closed by the stream handler once it has finished).
+        if self.cancel_w >= 0:
+            self.signal_cancel()
         for fd, sock in list(self.sockets.items()):
             try: sock.close()
             except: pass
@@ -240,6 +299,8 @@ RES_HDR_SIZE = 11
 
 # REQ hdr: opcode(B) seq(B) arglen(H) inlen(H) big-endian
 _REQ_HDR = struct.Struct('>BBHH')
+# BSDOP_CANCEL as the Amiga sends it: a bare header, no args, no input.
+_CANCEL_REQ = _REQ_HDR.pack(BSDOP_CANCEL, 0, 0, 0)
 # RES hdr: seq(B) result(i) errno(i) outlen(H) big-endian
 _RES_HDR = struct.Struct('>BiiH')
 
@@ -255,7 +316,8 @@ _OPNAME = {1:'SOCKET', 2:'CLOSE', 3:'CONNECT', 4:'BIND', 5:'LISTEN',
            11:'SETSOCKOPT', 12:'GETSOCKOPT', 13:'SHUTDOWN', 14:'GETSOCKNAME',
            15:'GETPEERNAME', 16:'GETHOSTBYNAME', 17:'GETHOSTBYADDR',
            18:'INET_ADDR', 19:'INET_NTOA', 20:'GETSERVBYNAME', 21:'GETSERVBYPORT',
-           22:'WAITSELECT', 23:'GETHOSTNAME', 24:'IOCTL'}
+           22:'WAITSELECT', 23:'GETHOSTNAME', 24:'IOCTL', 25:'PROTOVER',
+           26:'CANCEL'}
 
 def dispatch_op(sess: Session, opcode: int, args: bytes, indata: bytes) -> Tuple[int, int, bytes]:
     """Execute one Amiga library call.  Returns (result, errno_val, outdata).
@@ -354,6 +416,10 @@ def dispatch_op(sess: Session, opcode: int, args: bytes, indata: bytes) -> Tuple
             (fd, flags, maxlen) = struct.unpack_from('>HHI', args)
             sk = sess.sockets.get(fd)
             if not sk: return (-1, 9, b'')
+            # outlen is 16 bits on the wire and carries alen(1)+sockaddr(16)
+            # (+ a synthesised 20-byte IP header for DGRAM ICMP) + data: cap
+            # so it can never wrap (a wrap desyncs the Amiga dispatcher).
+            maxlen = min(maxlen, 0xffff - 17 - 20)
             try:
                 data, peer = sk.recvfrom(maxlen, translate_msgflags(flags))
                 peer_ip, peer_port = peer[0], peer[1]
@@ -395,12 +461,14 @@ def dispatch_op(sess: Session, opcode: int, args: bytes, indata: bytes) -> Tuple
             try:
                 llevel, lname = translate_sockopt(level, optname)
                 val = sk.getsockopt(llevel, lname, max(4, min(maxlen, 256)))
-                # SO_ERROR comes back as little-endian on Linux but Amiga expects
-                # the int value as a LONG.  Just preserve raw bytes; for SO_ERROR
-                # also translate via to_bsd_errno.
+                # Int-valued options come back in the Pi's native (little-
+                # endian) order; the Amiga reads big-endian LONGs.  SO_ERROR
+                # is additionally translated via to_bsd_errno.
                 if level == _AMIGA_SOL_SOCKET and optname == 0x1007:
-                    (errno_val,) = struct.unpack('<i', val[:4])
+                    (errno_val,) = struct.unpack('=i', val[:4])
                     val = struct.pack('>i', to_bsd_errno(errno_val))
+                elif _sockopt_is_int(level, optname):
+                    val = _swap_ints(val, '=', '>')
                 # outdata = optlen(2) optval[optlen]
                 out = struct.pack('>H', len(val)) + val
                 return (0, 0, out)
@@ -415,6 +483,8 @@ def dispatch_op(sess: Session, opcode: int, args: bytes, indata: bytes) -> Tuple
             if not sk: return (-1, 9, b'')
             try:
                 llevel, lname = translate_sockopt(level, optname)
+                if _sockopt_is_int(level, optname):
+                    indata = _swap_ints(indata, '>', '=')   # Amiga BE -> native
                 sk.setsockopt(llevel, lname, indata)
                 return (0, 0, b'')
             except OSError as e:
@@ -518,10 +588,16 @@ def dispatch_op(sess: Session, opcode: int, args: bytes, indata: bytes) -> Tuple
             rfds = [sess.sockets[i] for i in range(nfds) if (rm >> i) & 1 and i in sess.sockets]
             wfds = [sess.sockets[i] for i in range(nfds) if (wm >> i) & 1 and i in sess.sockets]
             efds = [sess.sockets[i] for i in range(nfds) if (em >> i) & 1 and i in sess.sockets]
+            # v6: include the cancel self-pipe so BSDOP_CANCEL (the Amiga
+            # caller got a sigmask signal) wakes this select().  The stream
+            # handler drains it before each WAITSELECT.
+            cancel_fd = sess.cancel_r
             try:
-                rr, ww, ee = select.select(rfds, wfds, efds, timeout)
+                rr, ww, ee = select.select(rfds + [cancel_fd], wfds, efds, timeout)
             except OSError as e:
                 return (-1, to_bsd_errno(e.errno or 0), b'')
+            if cancel_fd in rr:
+                rr.remove(cancel_fd)
             def mask(socks):
                 out = 0
                 for s in socks:
@@ -546,10 +622,16 @@ def dispatch_op(sess: Session, opcode: int, args: bytes, indata: bytes) -> Tuple
                 import fcntl, termios
                 try:
                     n = fcntl.ioctl(sk.fileno(), termios.FIONREAD, b'\0\0\0\0')
-                    return (struct.unpack('>I', n)[0], 0, b'')
+                    # The kernel fills a NATIVE int (little-endian on the Pi);
+                    # the count travels in the RES result field, which
+                    # encode_res_hdr packs big-endian for the Amiga.
+                    return (struct.unpack('=i', n)[0], 0, b'')
                 except OSError as e:
                     return (-1, to_bsd_errno(e.errno or 0), b'')
             return (-1, 22, b'')
+
+        elif opcode == BSDOP_PROTOVER:
+            return (BSD_PROTO_VERSION, 0, b'')
 
         else:
             log.warning('unimplemented opcode %d', opcode)
@@ -587,9 +669,9 @@ class A314Service:
             self.reader, self.writer = await asyncio.open_connection(A314D_HOST, A314D_PORT)
         if self.do_register:
             await self._register()
-            log.warning('a314bsd v4.54 ready (standalone) on service %s', SERVICE_NAME.decode())
+            log.warning('a314bsd v4.55 ready (standalone) on service %s', SERVICE_NAME.decode())
         else:
-            log.warning('a314bsd v4.54 ready (on-demand) on service %s', SERVICE_NAME.decode())
+            log.warning('a314bsd v4.55 ready (on-demand) on service %s', SERVICE_NAME.decode())
         await self._read_loop()
 
     async def _register(self):
@@ -622,6 +704,12 @@ class A314Service:
             elif mtype == MSG_DATA:
                 sess = self.sessions.get(sid)
                 if sess:
+                    # v6: the only thing the Amiga can send while a
+                    # WAITSELECT is in flight is BSDOP_CANCEL.  Handle it
+                    # here (the stream handler is blocked in the select).
+                    if sess.select_active and payload == _CANCEL_REQ:
+                        sess.signal_cancel()
+                        continue
                     sess.rx_buffer.extend(payload)
                     if hasattr(sess, '_data_event'):
                         sess._data_event.set()
@@ -662,10 +750,27 @@ class A314Service:
                 indata = bytes(sess.rx_buffer[REQ_HDR_SIZE+arglen:needed])
                 del sess.rx_buffer[:needed]
 
+                # v6: a CANCEL that arrives after its WAITSELECT already
+                # finished is stale — drop it without a response (the
+                # Amiga reads exactly one RES per WAITSELECT).
+                if opcode == BSDOP_CANCEL:
+                    continue
+
+                if opcode == BSDOP_WAITSELECT:
+                    sess.drain_cancel()
+                    # The CANCEL may already be queued behind the request.
+                    if bytes(sess.rx_buffer[:REQ_HDR_SIZE]) == _CANCEL_REQ:
+                        del sess.rx_buffer[:REQ_HDR_SIZE]
+                        sess.signal_cancel()
+                    sess.select_active = True
+
                 # Run dispatch in a thread for blocking ops so we don't stall
                 # the asyncio event loop.
-                result, errno_val, outdata = await loop.run_in_executor(
-                    None, dispatch_op, sess, opcode, args, indata)
+                try:
+                    result, errno_val, outdata = await loop.run_in_executor(
+                        None, dispatch_op, sess, opcode, args, indata)
+                finally:
+                    sess.select_active = False
 
                 # Write RES header
                 self._send_chunk(sess.stream_id,
@@ -683,6 +788,7 @@ class A314Service:
         finally:
             self.sessions.pop(sess.stream_id, None)
             sess.close_all()
+            sess.close_cancel_pipe()
 
     def _send_chunk(self, sid: int, data: bytes):
         # a314d DATA: header (plen, sid, mtype) + payload

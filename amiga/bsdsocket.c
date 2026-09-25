@@ -83,7 +83,10 @@ struct BsdRequest {
     /* Filled by dispatcher: */
     LONG               result;    /* >= 0 success / < 0 = -errno style */
     LONG               errno_val; /* Pi's errno (BSD/AmiTCP numbering) */
-    ULONG              outlen;    /* bytes written to outdata[] */
+    ULONG              outlen;    /* bytes the Pi sent (may exceed outmax) */
+    /* TRUE only for a WaitSelect RPC that may be cancelled (set by
+     * do_rpc_sig, cleared by do_rpc). */
+    UBYTE              cancellable;
 };
 
 /* ---- Global DOSBase (kept open forever once first opened) --------------- */
@@ -118,6 +121,8 @@ struct BsdSession {
     struct Task           *disp_task;
     struct MsgPort        *disp_port;     /* dispatcher's incoming request port */
     BYTE                   disp_kill_sig; /* allocated in dispatcher; we Signal it to ask exit */
+    BYTE                   disp_cancel_sig; /* allocated in dispatcher; Signal = cancel WaitSelect */
+    BYTE                   pi_proto;      /* Pi wire protocol: 0 = not probed, -1 = v5 (no CANCEL) */
 
     /* Reply port (lives in caller's task) for receiving dispatcher's replies */
     struct MsgPort         reply_port;
@@ -161,6 +166,7 @@ struct DispStartup {
     /* Filled by dispatcher before signalling parent: */
     struct MsgPort        *disp_port_out; /* dispatcher's request port */
     BYTE                   kill_sig_out;  /* signal bit dispatcher allocated for shutdown */
+    BYTE                   cancel_sig_out; /* signal bit dispatcher allocated for cancel */
     BOOL                   ready_ok;      /* TRUE on success */
 };
 
@@ -213,12 +219,48 @@ static BOOL do_rpc(struct BsdSession *sess)
         return FALSE;
     }
 
+    sess->req.cancellable      = 0;
     sess->req.msg.mn_ReplyPort = &sess->reply_port;
     sess->req.msg.mn_Length    = sizeof(struct BsdRequest);
     PutMsg(sess->disp_port, &sess->req.msg);
     WaitPort(&sess->reply_port);
     (void)GetMsg(&sess->reply_port);
     return TRUE;
+}
+
+/* do_rpc_sig: like do_rpc, but the caller also wakes on any signal in
+ * sigmask (WaitSelect).  On the first such signal it asks the dispatcher to
+ * send BSDOP_CANCEL, then keeps waiting for the (now prompt) reply so the
+ * stream stays in sync.  Returns the sigmask signals received while waiting
+ * (Wait() clears them, so the caller must merge them into its result).
+ * Only used when the Pi reported protocol >= 6. */
+static ULONG do_rpc_sig(struct BsdSession *sess, ULONG sigmask)
+{
+    struct ExecBase *SysBase = *(struct ExecBase **)4UL;
+    ULONG  replybit = 1UL << sess->reply_sig_bit;
+    ULONG  got = 0;
+    BOOL   cancel_sent = FALSE;
+
+    if (!sess->disp_task) {
+        sess->req.result    = -1;
+        sess->req.errno_val = 5;  /* EIO */
+        return 0;
+    }
+
+    sigmask &= ~replybit;
+    sess->req.cancellable      = 1;
+    sess->req.msg.mn_ReplyPort = &sess->reply_port;
+    sess->req.msg.mn_Length    = sizeof(struct BsdRequest);
+    PutMsg(sess->disp_port, &sess->req.msg);
+    while (GetMsg(&sess->reply_port) == NULL) {
+        ULONG sigs = Wait(replybit | sigmask);
+        got |= sigs & sigmask;
+        if (got && !cancel_sent) {
+            Signal(sess->disp_task, 1UL << sess->disp_cancel_sig);
+            cancel_sent = TRUE;
+        }
+    }
+    return got;
 }
 
 /* ---- Dispatcher task ---------------------------------------------------- */
@@ -255,10 +297,15 @@ static void dispatcher_entry(void)
     ULONG                  socket_id;
     struct MsgPort        *a314_port  = NULL;  /* reply port for A314 IO */
     struct MsgPort        *req_port   = NULL;  /* incoming request port */
+    struct MsgPort        *cw_port    = NULL;  /* reply port for cancel writes */
     struct A314_IORequest *ior        = NULL;
+    struct A314_IORequest *cw_ior     = NULL;  /* writes BSDOP_CANCEL while ior READ pends */
+    BOOL                   dev_open   = FALSE;
+    BOOL                   connected  = FALSE;
     UBYTE                  io_buf[BSD_MAX_CHUNK];
     BOOL                   running    = TRUE;
     BYTE                   kill_sig   = -1;
+    BYTE                   cancel_sig = -1;
 
     /* Pick up our startup info from the global slot.  Parent holds the
      * semaphore around this so only one dispatcher can start at a time. */
@@ -267,22 +314,37 @@ static void dispatcher_entry(void)
     sess = start->sess;
     socket_id = start->socket_id;
 
-    /* Allocate the kill signal — must be from THIS task's signal pool. */
+    /* Allocate the kill + cancel signals — must be from THIS task's pool. */
     kill_sig = AllocSignal(-1);
-    if (kill_sig == -1) goto fail_start;
+    if (kill_sig == -1) goto cleanup;
+    cancel_sig = AllocSignal(-1);
+    if (cancel_sig == -1) goto cleanup;
 
     /* Create our request port — signal bit allocated from THIS task.  Caller
      * will PutMsg to this port; Signal will wake us correctly. */
     req_port = CreateMsgPort();
-    if (!req_port) goto fail_start;
+    if (!req_port) goto cleanup;
 
     /* Create A314 IO request + reply port. */
     a314_port = CreateMsgPort();
-    if (!a314_port) goto fail_start;
+    if (!a314_port) goto cleanup;
     ior = (struct A314_IORequest *)CreateIORequest(a314_port, sizeof(struct A314_IORequest));
-    if (!ior) goto fail_start;
+    if (!ior) goto cleanup;
+
+    /* Second IO request on its own port, used only to write BSDOP_CANCEL
+     * while the main ior has an A314_READ pending (a314.device allows one
+     * pending READ and one pending WRITE per socket at the same time). */
+    cw_port = CreateMsgPort();
+    if (!cw_port) goto cleanup;
+    cw_ior = (struct A314_IORequest *)CreateIORequest(cw_port, sizeof(struct A314_IORequest));
+    if (!cw_ior) goto cleanup;
+
     if (OpenDevice((STRPTR)A314_NAME, 0, (struct IORequest *)ior, 0) != 0)
-        goto fail_start;
+        goto cleanup;
+    dev_open = TRUE;
+    cw_ior->a314_Request.io_Device = ior->a314_Request.io_Device;
+    cw_ior->a314_Request.io_Unit   = ior->a314_Request.io_Unit;
+    cw_ior->a314_Socket            = socket_id;
 
     /* Connect to the "bsdsocket" Pi service. */
     ior->a314_Socket  = socket_id;
@@ -290,12 +352,14 @@ static void dispatcher_entry(void)
     ior->a314_Length  = 9;
     ior->a314_Request.io_Command = A314_CONNECT;
     if (DoIO((struct IORequest *)ior) != A314_CONNECT_OK)
-        goto fail_after_open;
+        goto cleanup;
+    connected = TRUE;
 
-    /* Notify parent we're ready — hand over port + kill signal numbers. */
-    start->disp_port_out = req_port;
-    start->kill_sig_out  = kill_sig;
-    start->ready_ok      = TRUE;
+    /* Notify parent we're ready — hand over port + signal numbers. */
+    start->disp_port_out  = req_port;
+    start->kill_sig_out   = kill_sig;
+    start->cancel_sig_out = cancel_sig;
+    start->ready_ok       = TRUE;
     Signal(start->parent, 1L << start->parent_sig);
     start = NULL;   /* parent will free it */
 
@@ -313,6 +377,14 @@ static void dispatcher_entry(void)
             CONST_APTR src;
             ULONG  remaining;
             UWORD  chunk;
+
+            /* The header's inlen field is 16 bits: never stream more input
+             * than it announces, or the Pi reads the excess as the next
+             * request.  (Callers clamp already; this is the backstop.) */
+            if (req->inlen > BSD_MAX_INLEN) req->inlen = BSD_MAX_INLEN;
+            /* Drop a cancel left over from an earlier WaitSelect: the caller
+             * only signals it while waiting on THIS session's current RPC. */
+            SetSignal(0UL, 1UL << cancel_sig);
 
             /* --- Send REQ header packet --- */
             hdr[0] = req->opcode;
@@ -357,7 +429,31 @@ static void dispatcher_entry(void)
             ior->a314_Request.io_Command = A314_READ;
             ior->a314_Buffer = (STRPTR)io_buf;
             ior->a314_Length = BSD_MAX_CHUNK;
-            if (DoIO((struct IORequest *)ior) != A314_READ_OK
+            if (req->cancellable) {
+                /* WaitSelect: wait for the RES header OR a cancel request
+                 * from the caller.  On cancel, write a bare BSDOP_CANCEL
+                 * header on the second IO request; the Pi wakes its
+                 * select() and still sends exactly one RES, read below. */
+                BOOL cancel_sent = FALSE;
+                SendIO((struct IORequest *)ior);
+                while (!CheckIO((struct IORequest *)ior)) {
+                    ULONG sigs = Wait((1UL << a314_port->mp_SigBit) | (1UL << cancel_sig));
+                    if ((sigs & (1UL << cancel_sig)) && !cancel_sent) {
+                        UBYTE cpkt[BSD_REQ_HDR_SIZE];
+                        cpkt[0] = BSDOP_CANCEL; cpkt[1] = 0;
+                        w16(&cpkt[2], 0); w16(&cpkt[4], 0);
+                        cw_ior->a314_Request.io_Command = A314_WRITE;
+                        cw_ior->a314_Buffer = (STRPTR)cpkt;
+                        cw_ior->a314_Length = BSD_REQ_HDR_SIZE;
+                        DoIO((struct IORequest *)cw_ior);
+                        cancel_sent = TRUE;
+                    }
+                }
+                WaitIO((struct IORequest *)ior);
+            } else {
+                DoIO((struct IORequest *)ior);
+            }
+            if (ior->a314_Request.io_Error != A314_READ_OK
                 || ior->a314_Length < BSD_RES_HDR_SIZE) {
                 req->result = -1; req->errno_val = 6;  /* ENXIO */
                 goto reply;
@@ -414,29 +510,37 @@ reply:
         }
     }
 
-    /* --- Cleanup --- */
-    ior->a314_Request.io_Command = A314_EOS;
-    DoIO((struct IORequest *)ior);
-    CloseDevice((struct IORequest *)ior);
-    DeleteIORequest((struct IORequest *)ior);
-    DeleteMsgPort(a314_port);
-    DeleteMsgPort(req_port);
-    FreeSignal(kill_sig);
-    sess->disp_task = NULL;
-    /* Created via CreateNewProc → dos.library handles cleanup when we return. */
-    return;
-
-fail_after_open:
-    if (ior) DeleteIORequest((struct IORequest *)ior);
-fail_start:
+    /* --- Cleanup: one path for normal exit and startup failure, undoing
+     * everything in reverse order of acquisition. --- */
+cleanup:
+    if (connected) {
+        ior->a314_Request.io_Command = A314_EOS;
+        DoIO((struct IORequest *)ior);
+    }
+    if (dev_open)  CloseDevice((struct IORequest *)ior);
+    if (cw_ior)    DeleteIORequest((struct IORequest *)cw_ior);
+    if (cw_port)   DeleteMsgPort(cw_port);
+    if (ior)       DeleteIORequest((struct IORequest *)ior);
     if (a314_port) DeleteMsgPort(a314_port);
     if (req_port)  DeleteMsgPort(req_port);
-    if (kill_sig != -1) FreeSignal(kill_sig);
+    if (cancel_sig != -1) FreeSignal(cancel_sig);
+    if (kill_sig != -1)   FreeSignal(kill_sig);
+
+    /* Forbid BEFORE telling anyone we're gone: as soon as the parent / closer
+     * runs again it may free sess and (on the last close) expunge this very
+     * code, while we still have to execute the return below.  The Forbid
+     * lasts until this process has been removed (created via CreateNewProc,
+     * so dos.library's exit code does the rest). */
+    Forbid();
     if (start) {
+        /* Startup failed: bsd_open frees sess itself — don't touch it. */
         start->ready_ok = FALSE;
         Signal(start->parent, 1L << start->parent_sig);
+    } else {
+        sess->disp_task = NULL;
+        /* Wake bsd_close_lib, which Wait()s on the caller's reply signal. */
+        Signal(sess->caller_task, 1L << sess->reply_sig_bit);
     }
-    sess->disp_task = NULL;
     return;
 }
 
@@ -455,6 +559,7 @@ struct BsdBase *bsd_open(struct BsdBase *base)
 
     sess->caller_task   = FindTask(NULL);
     sess->disp_kill_sig = -1;
+    sess->disp_cancel_sig = -1;
 
     /* Reply port for receiving dispatcher's ReplyMsg.  Built manually so
      * we can hard-code the signal bit allocated from the caller's task. */
@@ -534,6 +639,7 @@ struct BsdBase *bsd_open(struct BsdBase *base)
     /* Pick up the port + kill-sig values the dispatcher filled in. */
     sess->disp_port = startup->disp_port_out;
     sess->disp_kill_sig = startup->kill_sig_out;
+    sess->disp_cancel_sig = startup->cancel_sig_out;
     FreeMem(startup, sizeof(*startup));
     ReleaseSemaphore(&s_disp_startup_sema);
 
@@ -574,16 +680,17 @@ void bsd_close_lib(struct BsdBase *base)
     struct BsdSession *sess    = find_session(base);
 
     if (sess) {
-        struct Library *DOSBase = get_dosbase(SysBase);
         Remove((struct Node *)&sess->node);
 
-        /* Ask dispatcher to exit, poll-wait for it to clear disp_task as
-         * the "I'm gone" indicator. */
+        /* Ask dispatcher to exit, then Wait for it to clear disp_task (it
+         * Signals our reply bit right after, under Forbid).  Must be a real
+         * Wait: exec calls Close under Forbid, so a busy-poll would never
+         * let the dispatcher run.  No request is in flight here, so the
+         * reply bit is free to use as the "I'm gone" signal. */
         if (sess->disp_task && sess->disp_kill_sig != -1) {
             Signal(sess->disp_task, 1L << sess->disp_kill_sig);
-            while (sess->disp_task) {
-                if (DOSBase) Delay(1);   /* 1 tick = 20 ms */
-            }
+            while (*(struct Task * volatile *)&sess->disp_task)
+                Wait(1L << sess->reply_sig_bit);
         }
 
         /* disp_port and disp_kill_sig live in the dispatcher's task — it
@@ -690,6 +797,9 @@ LONG bsd_send(LONG fd __asm("d0"), APTR buf __asm("a0"), LONG len __asm("d1"),
 {
     struct BsdSession *sess = find_session(base);
     if (!sess || len <= 0) return (len == 0) ? 0 : -1;
+    /* inlen is 16 bits on the wire: send at most BSD_MAX_SEND per call and
+     * return the short count (legal for send(); callers loop). */
+    if (len > BSD_MAX_SEND) len = BSD_MAX_SEND;
 
     sess->req.opcode = BSDOP_SEND;
     sess->req.arglen = 4;
@@ -721,6 +831,12 @@ LONG bsd_recv(LONG fd __asm("d0"), APTR buf __asm("a0"), LONG len __asm("d1"),
     sess->req.outmax  = (ULONG)len;
     do_rpc(sess);
     propagate_errno(sess);
+    /* Never report more than the dispatcher actually stored in buf. */
+    if (sess->req.result > 0) {
+        ULONG got = (sess->req.outlen < sess->req.outmax) ? sess->req.outlen
+                                                          : sess->req.outmax;
+        if ((ULONG)sess->req.result > got) sess->req.result = (LONG)got;
+    }
     return sess->req.result;
 }
 
@@ -864,7 +980,24 @@ LONG bsd_waitselect(LONG nfds __asm("d0"),
     struct BsdSession *sess    = find_session(base);
     UBYTE  out_buf[12];
     ULONG  rm, wm, em, tv_sec, tv_usec;
+    ULONG  mask = sigmask ? *sigmask : 0;
+    ULONG  got  = 0;
     if (!sess) return -1;
+
+    /* The Pi's select() can only be interrupted by our signals if it speaks
+     * protocol v6 (BSDOP_CANCEL).  Probe once per session; a v5 service
+     * answers the unknown opcode with -1 and we keep the old behaviour
+     * (signals are only looked at after the select returns). */
+    if (mask && sess->pi_proto == 0) {
+        sess->req.opcode = BSDOP_PROTOVER;
+        sess->req.arglen = 0;
+        sess->req.indata = NULL; sess->req.inlen = 0;
+        sess->req.outdata = NULL; sess->req.outmax = 0;
+        do_rpc(sess);
+        sess->pi_proto = (sess->req.result >= BSD_PROTO_VERSION)
+                       ? (BYTE)(sess->req.result > 127 ? 127 : sess->req.result)
+                       : -1;
+    }
 
     rm = rfds ? *rfds : 0;
     wm = wfds ? *wfds : 0;
@@ -882,10 +1015,15 @@ LONG bsd_waitselect(LONG nfds __asm("d0"),
     w32(&sess->req.args[18], tv_usec);
     sess->req.indata = NULL; sess->req.inlen = 0;
     sess->req.outdata = out_buf; sess->req.outmax = sizeof out_buf;
-    do_rpc(sess);
+    if (mask && sess->pi_proto > 0)
+        got = do_rpc_sig(sess, mask);     /* Wait()s on reply + sigmask */
+    else
+        do_rpc(sess);
     propagate_errno(sess);
 
-    if (sigmask) *sigmask = SetSignal(0UL, *sigmask) & *sigmask;
+    /* Report (and consume) the sigmask signals: the ones Wait() already
+     * cleared while we slept, plus any still pending. */
+    if (sigmask) *sigmask = (SetSignal(0UL, mask) & mask) | got;
     if (sess->req.result < 0) return -1;
     if (rfds) *rfds = ((ULONG)out_buf[0]<<24)|((ULONG)out_buf[1]<<16)|((ULONG)out_buf[2]<<8)|out_buf[3];
     if (wfds) *wfds = ((ULONG)out_buf[4]<<24)|((ULONG)out_buf[5]<<16)|((ULONG)out_buf[6]<<8)|out_buf[7];
@@ -977,8 +1115,16 @@ LONG bsd_accept(LONG fd __asm("d0"), APTR sa __asm("a0"), LONG *al __asm("a1"),
     do_rpc(sess);
     propagate_errno(sess);
     if (sess->req.result < 0) return -1;
-    /* out_buf[0] = addrlen, out_buf[1..] = sockaddr bytes */
-    alen = out_buf[0];
+    /* out_buf[0] = addrlen, out_buf[1..] = sockaddr bytes.  alen comes from
+     * the Pi: never copy past what was actually received into out_buf, and
+     * never more than a sockaddr_in (16). */
+    alen = (sess->req.outlen > 0) ? out_buf[0] : 0;
+    if (alen > 16) alen = 16;
+    {
+        ULONG got = (sess->req.outlen < sizeof out_buf) ? sess->req.outlen : sizeof out_buf;
+        if (got < 1) got = 1;
+        if ((ULONG)alen > got - 1) alen = (UBYTE)(got - 1);
+    }
     if (sa && al) {
         LONG cap = *al;
         if (cap < 0) cap = 0;
@@ -998,6 +1144,10 @@ LONG bsd_sendto(LONG fd __asm("d0"), APTR buf __asm("a0"), LONG len __asm("d1"),
     struct BsdSession *sess = find_session(base);
     UWORD i;
     if (!sess || len <= 0) return (len == 0) ? 0 : -1;
+    /* inlen is 16 bits on the wire.  Clamp to the full 65535 (not
+     * BSD_MAX_SEND) so any legal UDP datagram still goes out whole; stream
+     * sockets get a legal short count. */
+    if (len > BSD_MAX_INLEN) len = BSD_MAX_INLEN;
     if (al < 0 || al > 64) al = 16;
     sess->req.opcode = BSDOP_SENDTO;
     sess->req.arglen = 5 + (UWORD)al;
@@ -1054,9 +1204,19 @@ LONG bsd_recvfrom(LONG fd __asm("d0"), APTR buf __asm("a0"), LONG len __asm("d1"
     }
     /* layout: [0]=alen, [1..16]=sockaddr, [17..]=data */
     alen = ((UBYTE *)data_buf)[0];
+    if (alen > 16) alen = 16;
     for (i = 0; i < 17; i++) hdr_buf[i] = ((UBYTE *)data_buf)[i];
-    for (i = 0; i < sess->req.result && i < len; i++)
-        ((UBYTE *)buf)[i] = ((UBYTE *)data_buf)[17 + i];
+    {
+        /* Report only data bytes the dispatcher actually stored. */
+        ULONG got = (sess->req.outlen < sess->req.outmax) ? sess->req.outlen
+                                                          : sess->req.outmax;
+        ULONG n, k;
+        got = (got > 17) ? got - 17 : 0;
+        if ((ULONG)sess->req.result > got) sess->req.result = (LONG)got;
+        n = (ULONG)sess->req.result;
+        for (k = 0; k < n && k < (ULONG)len; k++)
+            ((UBYTE *)buf)[k] = ((UBYTE *)data_buf)[17 + k];
+    }
 
     if (sa && al) {
         LONG cap = *al;
@@ -1140,7 +1300,14 @@ static LONG _sockname_rpc(struct BsdSession *sess, UBYTE opcode,
     do_rpc(sess);
     propagate_errno(sess);
     if (sess->req.result < 0) return -1;
-    alen = out_buf[0];
+    /* Pi-supplied alen: cap at what arrived in out_buf and at 16. */
+    alen = (sess->req.outlen > 0) ? out_buf[0] : 0;
+    if (alen > 16) alen = 16;
+    {
+        ULONG got = (sess->req.outlen < sizeof out_buf) ? sess->req.outlen : sizeof out_buf;
+        if (got < 1) got = 1;
+        if ((ULONG)alen > got - 1) alen = (UBYTE)(got - 1);
+    }
     if (sa && al) {
         LONG cap = *al;
         if (cap < 0) cap = 0;

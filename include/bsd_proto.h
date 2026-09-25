@@ -97,6 +97,22 @@
 #define BSDOP_WAITSELECT    22
 #define BSDOP_GETHOSTNAME   23
 #define BSDOP_IOCTL         24
+/* Protocol v6 additions (2026-09-25).  Backward compatible: the library only
+ * sends BSDOP_CANCEL after BSDOP_PROTOVER reported >= 6, and a v5 Pi service
+ * answers BSDOP_PROTOVER like any unknown opcode (result -1, EINVAL). */
+#define BSDOP_PROTOVER      25
+#define BSDOP_CANCEL        26
+
+/* Wire protocol version reported by BSDOP_PROTOVER. */
+#define BSD_PROTO_VERSION   6
+
+/* The REQ header's inlen field is 16 bits, so one request can carry at most
+ * 65535 input bytes.  send()/SSL_write() clamp to BSD_MAX_SEND (the same
+ * 32 KB per-RPC size the Pi uses for recv) and return the short count, which
+ * stream sockets allow.  sendto() clamps to BSD_MAX_INLEN instead so every
+ * legal UDP datagram (<= 65507 bytes) still goes out whole. */
+#define BSD_MAX_INLEN       65535
+#define BSD_MAX_SEND        32768
 
 /* REQ header — 6 bytes big-endian. */
 #define BSD_REQ_HDR_SIZE 6
@@ -212,6 +228,19 @@ struct BsdResHdr {
  *
  * BSDOP_IOCTL          args: fd(2) request(4) arg(4)
  *                      result: 0 or value (e.g. FIONREAD returns bytes ready)
+ *
+ * BSDOP_PROTOVER       args: (none)                              [v6]
+ *                      result: BSD_PROTO_VERSION (v5 services: -1/EINVAL)
+ *
+ * BSDOP_CANCEL         args: (none)  -- a bare 6-byte REQ header [v6]
+ *                      NO RESPONSE, ever.  Sent by the dispatcher while a
+ *                      BSDOP_WAITSELECT is in flight, when the caller got a
+ *                      signal from its WaitSelect sigmask.  The Pi wakes the
+ *                      blocked select() (self-pipe) and answers the
+ *                      WAITSELECT normally (usually result 0, empty masks).
+ *                      If the select already finished, the CANCEL arrives as
+ *                      a stray request and is silently dropped, so exactly
+ *                      one RES is always sent per WAITSELECT.
  */
 
 #endif /* A314BSD_PROTO_H */
