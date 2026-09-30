@@ -994,7 +994,7 @@ LONG bsd_waitselect(LONG nfds __asm("d0"),
         sess->req.indata = NULL; sess->req.inlen = 0;
         sess->req.outdata = NULL; sess->req.outmax = 0;
         do_rpc(sess);
-        sess->pi_proto = (sess->req.result >= BSD_PROTO_VERSION)
+        sess->pi_proto = (sess->req.result >= 6)          /* cancel is v6 */
                        ? (BYTE)(sess->req.result > 127 ? 127 : sess->req.result)
                        : -1;
     }
@@ -1341,18 +1341,57 @@ void bsd_setsocketsignals(ULONG d0 __asm("d0"), ULONG d1 __asm("d1"),
 LONG bsd_getdtablesize(struct BsdBase *base __asm("a6"))
 { (void)base; return 32; }
 
-LONG bsd_obtainsocket(LONG d0 __asm("d0"), LONG d1 __asm("d1"),
-                      LONG d2 __asm("d2"), LONG d3 __asm("d3"),
+/* ---- ReleaseSocket / ReleaseCopyOfSocket / ObtainSocket (protocol v7) ----
+ * Hand a socket from one opener (session) to another - how a daemon passes
+ * an accepted connection to the process that serves it.  Every session's
+ * sockets live in the one Pi service, so the Pi keeps a table of released
+ * sockets keyed by id.  A v6 Pi answers these like any unknown opcode
+ * (-1), which is what the old stubs returned. */
+
+static LONG release_rpc(LONG fd, LONG id, UWORD copy, struct BsdBase *base)
+{
+    struct BsdSession *sess = find_session(base);
+    if (!sess) return -1;
+
+    sess->req.opcode = BSDOP_RELEASESOCKET;
+    sess->req.arglen = 8;
+    w16(&sess->req.args[0], (UWORD)fd);
+    w16(&sess->req.args[2], copy);
+    w32(&sess->req.args[4], (ULONG)id);
+    sess->req.indata = NULL; sess->req.inlen = 0;
+    sess->req.outdata = NULL; sess->req.outmax = 0;
+    do_rpc(sess);
+    propagate_errno(sess);
+    return sess->req.result;
+}
+
+LONG bsd_obtainsocket(LONG id __asm("d0"), LONG domain __asm("d1"),
+                      LONG type __asm("d2"), LONG proto __asm("d3"),
                       struct BsdBase *base __asm("a6"))
-{ (void)d0; (void)d1; (void)d2; (void)d3; (void)base; return -1; }
+{
+    struct BsdSession *sess = find_session(base);
+    if (!sess) return -1;
 
-LONG bsd_releasesocket(LONG d0 __asm("d0"), LONG d1 __asm("d1"),
+    sess->req.opcode = BSDOP_OBTAINSOCKET;
+    sess->req.arglen = 10;
+    w32(&sess->req.args[0], (ULONG)id);
+    w16(&sess->req.args[4], (UWORD)domain);
+    w16(&sess->req.args[6], (UWORD)type);
+    w16(&sess->req.args[8], (UWORD)proto);
+    sess->req.indata = NULL; sess->req.inlen = 0;
+    sess->req.outdata = NULL; sess->req.outmax = 0;
+    do_rpc(sess);
+    propagate_errno(sess);
+    return sess->req.result;
+}
+
+LONG bsd_releasesocket(LONG fd __asm("d0"), LONG id __asm("d1"),
                        struct BsdBase *base __asm("a6"))
-{ (void)d0; (void)d1; (void)base; return -1; }
+{ return release_rpc(fd, id, 0, base); }
 
-LONG bsd_releasecopyofsocket(LONG d0 __asm("d0"), LONG d1 __asm("d1"),
+LONG bsd_releasecopyofsocket(LONG fd __asm("d0"), LONG id __asm("d1"),
                               struct BsdBase *base __asm("a6"))
-{ (void)d0; (void)d1; (void)base; return -1; }
+{ return release_rpc(fd, id, 1, base); }
 
 ULONG bsd_inet_lnaof(ULONG in __asm("d0"), struct BsdBase *base __asm("a6"))
 { (void)base; return in & 0xFF; }

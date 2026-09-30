@@ -163,6 +163,18 @@ The same release also byte-swaps integer socket options (`SO_RCVBUF`,
 `SO_LINGER`, `TCP_NODELAY`, ...) and the `FIONREAD` count on the
 little-endian Pi, which were previously returned in the wrong byte order.
 
+### Wire protocol v7 (library 4.56, 2026-09-30)
+
+`ReleaseSocket()`, `ReleaseCopyOfSocket()` and `ObtainSocket()` work (they
+were stubs returning -1). A daemon that accepts a connection and hands it to
+another process, like a BBS listener passing a caller to its node, needs them.
+Every opener's sockets live in the one Pi service, so the Pi keeps a table of
+released sockets by id (`UNIQUE_ID` = -1 picks one); one that is never
+obtained is closed after 5 minutes. Two new opcodes, `BSDOP_RELEASESOCKET`
+(27) and `BSDOP_OBTAINSOCKET` (28). A v6 Pi answers them like unknown opcodes,
+so the calls fail exactly as the old stubs did. Verified on the A1200 with
+NilBBS, whose listener hands every call to a node this way.
+
 **Hardware-verified 2026-09-30** on the A1200 (68030, a314 clockport, OS 3.2.3)
 with the a314SSLlib `4.55+ssl` build and its Pi service: `amiga/bsdlive`
 against `test/liveserver.py` on the Pi passed 100000-byte sends and receives

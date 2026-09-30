@@ -40,6 +40,8 @@ import errno as _errno
 import logging
 import os
 import socket
+import time
+import threading
 import struct
 import sys
 from typing import Optional, Tuple
@@ -122,8 +124,10 @@ BSDOP_GETHOSTNAME   = 23
 BSDOP_IOCTL         = 24
 BSDOP_PROTOVER      = 25   # v6: result = BSD_PROTO_VERSION
 BSDOP_CANCEL        = 26   # v6: wake an in-flight WAITSELECT; NO response
+BSDOP_RELEASESOCKET = 27   # v7: args fd(2) copy(2) id(4); result = id
+BSDOP_OBTAINSOCKET  = 28   # v7: args id(4) domain(2) type(2) proto(2); result = fd
 
-BSD_PROTO_VERSION   = 6    # must match include/bsd_proto.h
+BSD_PROTO_VERSION   = 7    # must match include/bsd_proto.h
 
 # ---------------------------------------------------------------------------
 # AmiTCP <-> Linux constant translation
@@ -210,6 +214,26 @@ def to_bsd_errno(linux_err):
 # ---------------------------------------------------------------------------
 # Per-stream (= per-Amiga-task) session state
 # ---------------------------------------------------------------------------
+
+# v7: sockets handed between sessions (ReleaseSocket -> ObtainSocket), the
+# way a daemon passes an accepted connection to the process that serves it.
+# Module-level because every session lives in this one process; dispatch
+# runs on executor threads, hence the lock.  A released socket nobody
+# obtains is closed after _RELEASED_TTL seconds.
+_RELEASED = {}                  # id -> (socket, time.monotonic())
+_RELEASED_LOCK = threading.Lock()
+_RELEASED_TTL = 300
+_next_release_id = [0x40000000]
+UNIQUE_ID = -1
+
+
+def _released_expire(now):
+    for rid, (sk, t) in list(_RELEASED.items()):
+        if now - t > _RELEASED_TTL:
+            del _RELEASED[rid]
+            try: sk.close()
+            except OSError: pass
+
 
 class Session:
     """One Amiga OpenLibrary = one Session = one a314d stream.  Owns a
@@ -317,7 +341,7 @@ _OPNAME = {1:'SOCKET', 2:'CLOSE', 3:'CONNECT', 4:'BIND', 5:'LISTEN',
            15:'GETPEERNAME', 16:'GETHOSTBYNAME', 17:'GETHOSTBYADDR',
            18:'INET_ADDR', 19:'INET_NTOA', 20:'GETSERVBYNAME', 21:'GETSERVBYPORT',
            22:'WAITSELECT', 23:'GETHOSTNAME', 24:'IOCTL', 25:'PROTOVER',
-           26:'CANCEL'}
+           26:'CANCEL', 27:'RELEASESOCKET', 28:'OBTAINSOCKET'}
 
 def dispatch_op(sess: Session, opcode: int, args: bytes, indata: bytes) -> Tuple[int, int, bytes]:
     """Execute one Amiga library call.  Returns (result, errno_val, outdata).
@@ -352,6 +376,35 @@ def dispatch_op(sess: Session, opcode: int, args: bytes, indata: bytes) -> Tuple
                 if dgram_icmp_fallback:
                     sess.dgram_icmp_fds.add(fd)
             return (fd, 0, b'')
+
+        elif opcode == BSDOP_RELEASESOCKET:
+            (fd, copy, rid) = struct.unpack_from('>HHi', args)
+            sk = sess.sockets.get(fd)
+            if not sk: return (-1, 9, b'')          # EBADF
+            with _RELEASED_LOCK:
+                now = time.monotonic()
+                _released_expire(now)
+                if rid == UNIQUE_ID:
+                    _next_release_id[0] += 1
+                    rid = _next_release_id[0]
+                elif rid in _RELEASED:
+                    return (-1, 22, b'')            # EINVAL: that id is taken
+                if copy:
+                    try: sk = sk.dup()
+                    except OSError as e: return (-1, to_bsd_errno(e.errno or 0), b'')
+                else:
+                    sess.sockets.pop(fd, None)      # moved, not closed
+                    sess.raw_fds.discard(fd)
+                    sess.dgram_icmp_fds.discard(fd)
+                _RELEASED[rid] = (sk, now)
+            return (rid, 0, b'')
+
+        elif opcode == BSDOP_OBTAINSOCKET:
+            (rid,) = struct.unpack_from('>i', args)
+            with _RELEASED_LOCK:
+                ent = _RELEASED.pop(rid, None)
+            if not ent: return (-1, 22, b'')         # EINVAL: nothing released under it
+            return (sess.alloc_fd(ent[0]), 0, b'')
 
         elif opcode == BSDOP_CLOSE:
             (fd,) = struct.unpack_from('>H', args)

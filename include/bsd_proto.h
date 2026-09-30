@@ -102,9 +102,13 @@
  * answers BSDOP_PROTOVER like any unknown opcode (result -1, EINVAL). */
 #define BSDOP_PROTOVER      25
 #define BSDOP_CANCEL        26
+/* Protocol v7 additions (2026-09-30): hand a socket between openers.  A v6
+ * Pi answers them like any unknown opcode (-1), as the old stubs did. */
+#define BSDOP_RELEASESOCKET 27  /* args: fd(2) copy(2) id(4); result: id or -1 */
+#define BSDOP_OBTAINSOCKET  28  /* args: id(4) domain(2) type(2) proto(2); result: fd or -1 */
 
 /* Wire protocol version reported by BSDOP_PROTOVER. */
-#define BSD_PROTO_VERSION   6
+#define BSD_PROTO_VERSION   7
 
 /* The REQ header's inlen field is 16 bits, so one request can carry at most
  * 65535 input bytes.  send()/SSL_write() clamp to BSD_MAX_SEND (the same
