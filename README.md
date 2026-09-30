@@ -163,6 +163,22 @@ The same release also byte-swaps integer socket options (`SO_RCVBUF`,
 `SO_LINGER`, `TCP_NODELAY`, ...) and the `FIONREAD` count on the
 little-endian Pi, which were previously returned in the wrong byte order.
 
+**Hardware-verified 2026-09-30** on the A1200 (68030, a314 clockport, OS 3.2.3)
+with the a314SSLlib `4.55+ssl` build and its Pi service: `amiga/bsdlive`
+against `test/liveserver.py` on the Pi passed 100000-byte sends and receives
+(4 × `send()`, largest 32768), and a `WaitSelect()` with a 60 s timeout
+returned 0 with `SIGBREAKF_CTRL_C` 5.4 s after a `Break`, with the next
+request on the same library still in step. wget (HTTP), NetHarness, AmiTime
+and Amelinium over HTTPS all work. A v5 Pi answered the version probe with
+"unimplemented opcode 25" and the library fell back as designed.
+
+Running it: copy `test/liveserver.py` to the Pi and start it
+(`python3 liveserver.py`; `-dump` logs raw bytes instead), then on the Amiga
+`bsdlive BIG` and `bsdlive WAIT` (Break the process while it waits). The Pi
+service is spawned once and outlives Amiga reboots: after updating
+`bsdsocket.py`, kill it (`kill -9`; it ignores SIGTERM) while the Amiga
+reboots, so the next connect starts the new code.
+
 ---
 
 ## Known limitations / stubs

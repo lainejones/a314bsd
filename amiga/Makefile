@@ -35,6 +35,10 @@ bsdnet: bsdnet.c
 fdchurn: fdchurn.c
 	$(TESTCC) $(TESTCFLAGS) -o $@ $<
 
+# on-hardware checks for the 4.55 changes (server: ../test/liveserver.py on the Pi)
+bsdlive: bsdlive.c
+	$(TESTCC) $(TESTCFLAGS) -o $@ $<
+
 # NetBridge — GadTools network control panel (front-end for the bsdctl service)
 netbridge: netbridge.c
 	$(TESTCC) $(TESTCFLAGS) -o $@ $<
