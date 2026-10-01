@@ -192,6 +192,30 @@ int main(int argc, char **argv)
         Delay(50);
         CloseSocket(s);
         ok = 1;
+    } else if (!strcasecmp(mode, "WAITNOSIG") || !strcasecmp(mode, "HOLD")) {
+        /* idle-cost probes (run CPUMeter alongside): one quiet connected
+           socket for 30 s, in a WaitSelect without a signal mask (the
+           pre-v6 path), or with nothing pending at all */
+        LONG s = tconnect(host, port);
+        if (s < 0) return 10;
+        sendline(s, "H\n");
+        if (!strcasecmp(mode, "HOLD")) {
+            out("holding 30 s");
+            Delay(30 * 50);
+        } else {
+            struct timeval tv;
+            fd_set rf;
+            LONG r;
+            FD_ZERO(&rf);
+            FD_SET(s, &rf);
+            tv.tv_sec = 30;
+            tv.tv_usec = 0;
+            out("WaitSelect 30 s, no signal mask");
+            r = WaitSelect(s + 1, &rf, NULL, NULL, &tv, NULL);
+            printf("WaitSelect = %ld\n", r);
+        }
+        CloseSocket(s);
+        ok = 1;
     } else if (!strcasecmp(mode, "WAIT"))
         ok = do_wait(host, port);
     else
