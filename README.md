@@ -44,7 +44,17 @@ after reboots.
 
 ### Amiga (one time)
 
-Copy the compiled files to the Amiga:
+Double-click **Install_a314bsd** (or `Installer Install_a314bsd` in a Shell, in the
+package drawer). It puts `bsdsocket.library` in `LIBS:`, `bsdnet` in `C:` and
+`NetBridge` (with its icon) in a drawer you pick, and it looks at the
+`bsdsocket.library` already in `LIBS:` first:
+
+- **another TCP/IP stack's** (Roadshow, AmiTCP, Miami): asks before replacing it,
+  and keeps it as `LIBS:bsdsocket.library.bak` (the first backup is never overwritten);
+- **a314SSLlib's** (this proxy *with* HTTPS): keeps it unless you choose Replace;
+- **an older a314bsd**: updates it without asking.
+
+Or copy the files by hand:
 
 ```
 bsdsocket.library  ->  LIBS:

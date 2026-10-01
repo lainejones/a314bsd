@@ -1,0 +1,105 @@
+; -------------------------------------------------------------------------
+; a314bsd - Installer script
+; Installs bsdsocket.library (the A314 proxy) in LIBS:, the bsdnet command in C:
+; and the NetBridge control panel where you choose.  Double-click Install_a314bsd,
+; or from a Shell in this drawer:   Installer Install_a314bsd
+;
+; It looks at the bsdsocket.library already in LIBS: first:
+;   - another TCP/IP stack's (Roadshow, AmiTCP, Miami): asks, keeps it as .bak
+;   - a314SSLlib's (the same proxy WITH HTTPS): keeps it unless you say otherwise
+;   - an older a314bsd: just updates it
+; Run it again to update: the first .bak is never overwritten.
+; -------------------------------------------------------------------------
+(set @app-name "a314bsd")
+(complete 0)
+
+(if (not (exists "a314bsd/bsdsocket.library"))
+    (abort "Can't find the a314bsd drawer next to this script.\n\n"
+           "Run the installer from the drawer it came in."))
+(if (< (/ (getversion "exec.library" (resident)) 65536) 39)
+    (abort "a314bsd needs AmigaOS 3.0 or newer."))
+
+(message "a314bsd - bsdsocket.library over the A314\n\n"
+         "Networking for an Amiga with an A314 board: programs that use bsdsocket.library "
+         "(web browsers, FTP, SMB, ping...) work through the Raspberry Pi's network.\n\n"
+         "You also need the Pi side installed (see the end of this installer). "
+         "For https:// add the a314SSLlib package afterwards.")
+
+(if (not (exists "DEVS:a314.device" (noreq)))
+    (if (= 0 (askbool (prompt "DEVS:a314.device was not found.\n\n"
+                              "a314bsd talks to the Pi through the A314 software. Install that first "
+                              "(the A314 drivers), or continue if you're setting this Amiga up in advance.")
+                      (help "Without the A314 device driver the library can't reach the Pi, so programs "
+                            "will find no network.")
+                      (choices "Continue" "Abort") (default 1)))
+        (abort "Install the A314 software first, then run this installer again.")))
+(complete 10)
+
+; ---- what bsdsocket.library is in LIBS: now ------------------------------------
+(set lib "LIBS:bsdsocket.library")
+(set have (exists lib (noreq)))
+(set ours 0)
+(set ssl 0)
+(if have
+  (
+    (if (= 0 (run (cat "Search >NIL: " lib " \"a314bsd bsdsocket.library\"") (safe))) (set ours 1))
+    (if ours (if (= 0 (run (cat "Search >NIL: " lib " \"+ssl\"") (safe))) (set ssl 1)))
+  ))
+
+(set putlib 1)
+(if (and have (= ours 0))
+    (if (= 0 (askbool (prompt "LIBS: already has a bsdsocket.library from another TCP/IP stack "
+                              "(Roadshow, AmiTCP, Miami...).\n\n"
+                              "a314bsd replaces it: this Amiga's networking then goes through the A314 and "
+                              "the Pi.  Your library is kept as LIBS:bsdsocket.library.bak.")
+                      (help "Choose Keep mine on an Amiga that has its own network card or modem stack and "
+                            "no A314.  To go back later: copy LIBS:bsdsocket.library.bak over LIBS:bsdsocket.library.")
+                      (choices "Replace" "Keep mine") (default 1)))
+        (exit "Nothing was changed - your bsdsocket.library stays." (quiet))))
+(if ssl
+    (if (= 0 (askbool (prompt "Your bsdsocket.library is the a314SSLlib version - the same A314 proxy "
+                              "with HTTPS built in.\n\n"
+                              "Keep it? The tools (bsdnet, NetBridge) work with it as they are.")
+                      (help "Replace only if you want to go back to the plain library (no https://).")
+                      (choices "Keep it" "Replace") (default 0)))
+        (set putlib 1)
+        (set putlib 0)))
+(complete 30)
+
+; ---- the library ------------------------------------------------------------------
+(if putlib
+  (
+    ; the first backup only: a re-run must not copy our own library over the real stack's
+    (if (and have (= ours 0) (not (exists "LIBS:bsdsocket.library.bak" (noreq))))
+        (copyfiles (source lib) (dest "LIBS:") (newname "bsdsocket.library.bak") (nogauge)))
+    (copyfiles (prompt "Installing bsdsocket.library in LIBS:") (help @copyfiles-help)
+               (source "a314bsd/bsdsocket.library") (dest "LIBS:") (nogauge))
+  ))
+(complete 50)
+
+; ---- bsdnet (CLI) -> C: --------------------------------------------------------------
+(copyfiles (prompt "Installing bsdnet in C:") (help @copyfiles-help)
+           (source "a314bsd/bsdnet") (dest "C:") (nogauge))
+(run "Protect C:bsdnet +e" (safe))
+(complete 65)
+
+; ---- NetBridge (GUI) ----------------------------------------------------------------
+(set nbdir
+    (askdir (prompt "Where should the NetBridge control panel go?\n\n"
+                    "(Connect / Disconnect the network, ping, network status - with an icon)")
+            (help "Any drawer you open from Workbench, for example SYS:Tools or SYS:Utilities.")
+            (default (if (exists "SYS:Tools" (noreq)) "SYS:Tools" "SYS:"))))
+(copyfiles (prompt "Installing NetBridge") (help @copyfiles-help)
+           (source "a314bsd") (dest nbdir) (choices "NetBridge" "NetBridge.info") (nogauge))
+(run (cat "Protect \"" (tackon nbdir "NetBridge") "\" +e") (safe))
+(set @default-dest nbdir)
+(complete 90)
+
+(message (if putlib "a314bsd is installed:\n\nLIBS:bsdsocket.library\n"
+                    "a314bsd's tools are installed.\nYour a314SSLlib library was kept.\n\n")
+         "C:bsdnet\n" (tackon nbdir "NetBridge") "\n\n"
+         "In a Shell: bsdnet status / start / stop / ping - or double-click NetBridge.\n\n"
+         (if putlib (cat "The Pi side, once: copy the pi drawer to the Pi and run  sudo ./install.sh  there. "
+                         "Then reboot this Amiga (or quit every network program) so the new library is loaded.")
+                    ""))(complete 100)
+(exit (quiet))
