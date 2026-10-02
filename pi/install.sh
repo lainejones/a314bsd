@@ -19,7 +19,7 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 A314_DIR="/opt/a314"
-CONF_FILE=""
+CONF_FILE="${CONF_FILE:-}"   # override: sudo CONF_FILE=/path/to/a314d.conf ./install.sh
 PYTHON=""
 
 # --------------------------------------------------------------------------
@@ -42,8 +42,12 @@ else
     exit 1
 fi
 
-# Locate a314d.conf
-for candidate in "$A314_DIR/a314d.conf" \
+# Locate a314d.conf (unless CONF_FILE was given)
+if [ -n "$CONF_FILE" ] && [ ! -f "$CONF_FILE" ]; then
+    echo "ERROR: CONF_FILE=$CONF_FILE does not exist."
+    exit 1
+fi
+[ -z "$CONF_FILE" ] && for candidate in "$A314_DIR/a314d.conf" \
                  "/etc/opt/a314/a314d.conf" \
                  "/etc/a314d.conf" \
                  "/etc/a314/a314d.conf"; do
@@ -60,7 +64,7 @@ fi
 
 if [ -z "$CONF_FILE" ]; then
     echo "ERROR: a314d.conf not found."
-    echo "  Pass it explicitly: CONF_FILE=/path/to/a314d.conf ./install.sh"
+    echo "  Pass it explicitly: sudo CONF_FILE=/path/to/a314d.conf ./install.sh"
     exit 1
 fi
 
@@ -147,15 +151,22 @@ echo "   journalctl -u a314d -f"
 echo "   (then open bsdsocket.library from the Amiga)"
 echo ""
 echo "------------------------------------------------------------"
-echo " Amiga side (copy these files to the Amiga once only)"
+echo " Amiga side (once)"
 echo "------------------------------------------------------------"
 echo ""
-echo "   bsdsocket.library  ->  LIBS:"
+echo " Double-click Install_a314bsd in the package drawer on the Amiga"
+echo " (or: Installer Install_a314bsd). It installs bsdsocket.library"
+echo " in LIBS:, bsdnet in C: and the NetBridge control panel, and"
+echo " backs up another stack's bsdsocket.library first."
 echo ""
-echo " That is all. No Startup-Sequence changes are needed."
-echo " Any software that uses bsdsocket.library (browsers, FTP"
-echo " clients, SMB clients, etc.) will work immediately."
+echo " By hand instead: bsdsocket.library -> LIBS:, and optionally"
+echo " bsdnet -> C: and NetBridge + NetBridge.info -> any drawer"
+echo " (after a .zip download: protect bsdnet +e, protect NetBridge +e)."
+echo ""
+echo " No Startup-Sequence changes are needed."
 echo ""
 echo " HTTPS/TLS is NOT in this base library. For https:// support add the"
 echo " companion a314SSLlib project (its installer supersedes this one)."
+echo " If a314SSLlib was installed on this Pi, run ITS install.sh again:"
+echo " this one has just replaced its bsdsocket.py with the SSL-free one."
 echo "============================================================"

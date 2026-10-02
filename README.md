@@ -4,7 +4,7 @@ Replaces `bsdsocket.library` on the Amiga with a proxy that forwards all
 AmiTCP-compatible BSD socket calls to a Python service on the Raspberry Pi.
 The Pi's TCP/IP stack does the actual networking; the Amiga 68000 does nothing.
 
-**Tested working:** AWeb / IBrowse (HTTP), smb2fs (SMB shares), ping, test_bsd HTTP.
+**Tested working:** AWeb / IBrowse (HTTP), smb2fs (SMB shares), ping, wget.
 
 > **HTTPS?** This base library is deliberately SSL-free. For HTTPS/TLS, add the
 > companion **[a314SSLlib](../a314SSLlib)** project — it layers AmiSSL-compatible
@@ -38,6 +38,17 @@ The script:
    (so NetBridge's network on/off can create its pause flag)
 4. Restarts `a314d`
 
+If your `a314d.conf` is somewhere unusual, name it:
+`sudo CONF_FILE=/path/to/a314d.conf ./install.sh` (otherwise the script looks in
+`/opt/a314`, `/etc/opt/a314`, `/etc` and `/etc/a314`, then searches).
+
+> **Using a314SSLlib (HTTPS) as well?** Install the Pi side from the
+> **a314SSLlib** package, not this one. Its `bsdsocket.py` is a superset of
+> this one; running this package's `install.sh` afterwards replaces it with the
+> SSL-free version and HTTPS stops working. The Pi service keeps running across
+> Amiga reboots, so after replacing `bsdsocket.py` stop the old process
+> (`sudo kill -9 <pid>`; it ignores SIGTERM) and the next connect starts the new one.
+
 After this, the services launch automatically whenever the Amiga opens
 `bsdsocket.library` or the `bsdctl` service. No manual startup is needed
 after reboots.
@@ -58,13 +69,17 @@ Or copy the files by hand:
 
 ```
 bsdsocket.library  ->  LIBS:
-NetBridge          ->  anywhere (has an icon) — network control panel
+NetBridge + NetBridge.info ->  any drawer — network control panel
 bsdnet             ->  C: (or anywhere on your path) — CLI equivalent
 ```
 
 Only `bsdsocket.library` is required; `NetBridge` and `bsdnet` are optional
 tools for pausing/resuming the proxy and pinging. No `Startup-Sequence`
 changes are needed.
+
+Use the `.lha` archive if you can. A `.zip` loses AmigaDOS protection bits, so
+after unpacking a `.zip` make the programs executable:
+`protect NetBridge +e` and `protect C:bsdnet +e` (the installer does this for you).
 
 ---
 
@@ -75,7 +90,8 @@ Any software that calls `OpenLibrary("bsdsocket.library", 4)` will work:
 - **Web browsers**: AWeb, IBrowse — open normally, browse as usual
 - **SMB shares**: `smb2fs mount smb://user:pass@server/share mountpoint:`
 - **FTP clients**: any AmiTCP-compatible FTP client
-- **Custom tools**: `test_bsd example.com 80 /` (included smoke test)
+- **Smoke test**: `test_bsd example.com 80 /` - not in the release archive;
+  build it from source with `make test_bsd` in `amiga/`
 
 ### Network control (NetBridge)
 
@@ -207,7 +223,7 @@ reboots, so the next connect starts the new code.
 
 | Function | Status |
 |----------|--------|
-| `ObtainSocket` / `ReleaseSocket` | Returns `EOPNOTSUPP` |
+| `ObtainSocket` / `ReleaseSocket` / `ReleaseCopyOfSocket` | ✅ Implemented in 4.56 (needs the protocol v7 Pi service) |
 | `sendmsg` / `recvmsg` | Returns `EOPNOTSUPP` |
 | `getservbyname` / `getservbyport` | ✅ Implemented |
 | `SocketBaseTagList` ERRNOPTR tag | Ignored (use `Errno()`) |
@@ -223,7 +239,7 @@ amiga/
   bsdsocket.c      C implementation of all socket calls
   netbridge.c      NetBridge — GadTools network control panel
   bsdnet.c         CLI control tool (bsdnet start|stop|status)
-  test_bsd.c       Smoke-test HTTP client
+  test_bsd.c       Smoke-test HTTP client (make test_bsd; not shipped)
   Makefile
 
 include/
