@@ -7,7 +7,7 @@ The Pi's TCP/IP stack does the actual networking; the Amiga 68000 does nothing.
 **Tested working:** AWeb / IBrowse (HTTP), smb2fs (SMB shares), ping, wget.
 
 > **HTTPS?** This base library is deliberately SSL-free. For HTTPS/TLS, add the
-> companion **[a314SSLlib](../a314SSLlib)** project — it layers AmiSSL-compatible
+> companion **a314SSLlib** project (separate, not published yet) — it layers AmiSSL-compatible
 > TLS on top of this base (TLS offloaded to the Pi), with no changes to a314bsd.
 
 ---
@@ -227,7 +227,7 @@ reboots, so the next connect starts the new code.
 | `sendmsg` / `recvmsg` | Returns `EOPNOTSUPP` |
 | `getservbyname` / `getservbyport` | ✅ Implemented |
 | `SocketBaseTagList` ERRNOPTR tag | Ignored (use `Errno()`) |
-| HTTPS / TLS | Not in base — add the companion **[a314SSLlib](../a314SSLlib)** project (Pi-side TLS offload; Amiga clock need not be correct — the Pi verifies certs) |
+| HTTPS / TLS | Not in base — add the companion **a314SSLlib** project (separate, not published yet) (Pi-side TLS offload; Amiga clock need not be correct — the Pi verifies certs) |
 
 ---
 

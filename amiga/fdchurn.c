@@ -14,7 +14,7 @@
  *          (must fill the holes, staying < 8), then close all.
  *
  * Run on Amiga:  fdchurn [HOST] [PORT/N] [PATH]
- *   defaults: 192.168.50.33 8099 /bench/bench.bin
+ *   defaults: 192.168.1.100 8099 /bench/bench.bin
  *   (any URL path works; the test only reads the first bytes of the
  *   response and closes.)
  */
@@ -85,7 +85,7 @@ int main(int argc, char **argv)
 {
     struct RDArgs *rdargs;
     LONG   rda[3];
-    STRPTR host = (STRPTR)"192.168.50.33";
+    STRPTR host = (STRPTR)"192.168.1.100";
     LONG   port = 8099;
     STRPTR path = (STRPTR)"/bench/bench.bin";
     BYTE   hostbuf[128], pathbuf[128];
