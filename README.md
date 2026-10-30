@@ -105,6 +105,23 @@ service, `pi/bsdctl.py`). While paused, **new** connections are refused with
   **Net Status** (results shown in a requester). Talks the `bsdctl` service
   directly, so it works even when `bsdsocket.library` is paused.
 
+  Every action is also on the right-mouse menu bar and the keyboard:
+
+  | Menu | Item | Amiga key | Plain key |
+  |------|------|-----------|-----------|
+  | Project | About... | `Amiga-?` | |
+  | Project | Quit | `Amiga-Q` | `Esc` (or the close gadget) |
+  | Network | Connect | `Amiga-O` | `C` |
+  | Network | Disconnect | `Amiga-D` | `D` |
+  | Network | Refresh | `Amiga-R` | `R` |
+  | Network | Ping host... | `Amiga-P` | `P` |
+  | Network | Net Status... | `Amiga-N` | `N` |
+
+  The plain keys are the underlined button letters (they do nothing while the
+  Host field is being edited). NetBridge has no settings or tooltypes, so there
+  is no Settings menu. The window lays out in the screen font, falls back to
+  Topaz 8 when that font would make it too big, and fits a 640x200 screen.
+
 ---
 
 ## Build (Amiga library)
@@ -238,6 +255,7 @@ amiga/
   lib_start.S      ROM tag, LVO jump table (50 entries)
   bsdsocket.c      C implementation of all socket calls
   netbridge.c      NetBridge — GadTools network control panel
+  amigui.c/.h      Shared GUI helpers NetBridge uses (About box)
   bsdnet.c         CLI control tool (bsdnet start|stop|status)
   test_bsd.c       Smoke-test HTTP client (make test_bsd; not shipped)
   Makefile

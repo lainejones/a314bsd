@@ -40,8 +40,9 @@ bsdlive: bsdlive.c
 	$(TESTCC) $(TESTCFLAGS) -o $@ $<
 
 # NetBridge — GadTools network control panel (front-end for the bsdctl service)
-netbridge: netbridge.c
-	$(TESTCC) $(TESTCFLAGS) -o $@ $<
+# (amigui.c/.h: shared About box + settings helpers, copied from C:\projects\tools\amigui)
+netbridge: netbridge.c amigui.c amigui.h
+	$(TESTCC) $(TESTCFLAGS) -Wall -Wno-pointer-sign -o $@ netbridge.c amigui.c
 
 clean:
 	rm -f $(OBJS) $(TARGET) test_bsd bsdnet fdchurn bsdnetgui netbridge
