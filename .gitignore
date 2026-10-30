@@ -9,3 +9,6 @@ amiga/fdchurn
 amiga/netbridge
 pi/__pycache__/
 amiga/bsdlive
+
+# Release staging (packages + notes; archives are built on the Amiga)
+dist/
