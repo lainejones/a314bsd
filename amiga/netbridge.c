@@ -42,7 +42,7 @@
 #include "amigui.h"
 
 #define NBR_NAME    "NetBridge"
-#define NBR_VERSION "1.1"
+#define NBR_VERSION "4.56.2"
 
 unsigned long __stack = 16000;
 static const char vers[] = "$VER: " NBR_NAME " " NBR_VERSION " (30.10.2026)";
