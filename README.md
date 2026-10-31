@@ -65,6 +65,9 @@ package drawer). It puts `bsdsocket.library` in `LIBS:`, `bsdnet` in `C:` and
 - **a314SSLlib's** (this proxy *with* HTTPS): keeps it unless you choose Replace;
 - **an older a314bsd**: updates it without asking.
 
+The `a314bsd` drawer comes with a plain drawer icon; the installer then gives it
+your Workbench's own drawer icon.
+
 Or copy the files by hand:
 
 ```

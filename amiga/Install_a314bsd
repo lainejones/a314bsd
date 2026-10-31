@@ -95,6 +95,15 @@
 (set @default-dest nbdir)
 (complete 90)
 
+; the a314bsd drawer (next to this script) came with a plain drawer icon so it
+; shows when unpacked; from now on it has this Workbench's own
+; (ENV:Sys/def_drawer.info). Never at a disk root: a root has no drawer icon.
+(set pkgdir (tackon (expandpath "") "a314bsd"))
+(if (and (exists "ENV:Sys/def_drawer.info" (noreq))
+         (<> (substr pkgdir (- (strlen pkgdir) 1) 1) ":"))
+    (if (exists (cat pkgdir ".info") (noreq))
+        (run (cat "Copy >NIL: ENV:Sys/def_drawer.info \"" pkgdir ".info\""))))
+
 (message (if putlib "a314bsd is installed:\n\nLIBS:bsdsocket.library\n"
                     "a314bsd's tools are installed.\nYour a314SSLlib library was kept.\n\n")
          "C:bsdnet\n" (tackon nbdir "NetBridge") "\n\n"
